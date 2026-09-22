@@ -198,6 +198,20 @@ public:
 	// there); D3D11Backend converts to its combiner's internal form, mirroring
 	// Set_Shader's LESSEQUAL inversion for INVSRCALPHA blends.
 	virtual void Set_Alpha_Reference(float ref) = 0;
+	// OM render-target write mask (D3DRS_COLORWRITEENABLE, low 4 bits R/G/B/A).
+	// Default no-op: the DX8 backend drives this through the raw D3D8 device, the
+	// D3D11 backend honours it (see D3D11Backend::Set_Color_Write_Enable).
+	virtual void Set_Color_Write_Enable(unsigned int /*mask*/) {}
+	// W3DNext: raw DX8 blend-state writes (D3DRS_ALPHABLENDENABLE / SRCBLEND /
+	// DESTBLEND - e.g. the soft-water-edge DESTALPHA blend and the water alpha
+	// pass) forwarded as D3DBLEND_* codes. Default no-op: the DX8 backend
+	// drives them through the real device; the D3D11 backend overrides.
+	virtual void Set_Raw_Blend_Enable(unsigned int /*enable*/) {}
+	virtual void Set_Raw_Src_Blend(unsigned int /*d3dblend*/) {}
+	virtual void Set_Raw_Dst_Blend(unsigned int /*d3dblend*/) {}
+	// Raw stencil render-state write (D3DRS_STENCILENABLE..D3DRS_STENCILWRITEMASK
+	// codes) - drives the volumetric shadow passes on the D3D11 backend.
+	virtual void Set_Raw_Stencil(unsigned int /*d3drs*/, unsigned int /*value*/) {}
 	virtual void Set_Material(const VertexMaterialClass * material) = 0;
 	virtual void Set_Texture(unsigned int stage, TextureBaseClass * texture) = 0;
 

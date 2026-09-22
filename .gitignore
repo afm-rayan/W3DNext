@@ -49,6 +49,25 @@ thumbs.db
 /Dependencies/MaxSDK/maxsdk
 /tmp/
 
+## Local-only folders (machine snapshots, never upstreamed)
+/Backup/
+/Release/
+/Common/
+/INI/
+/D3D11_Port_Backup_2026-08-16.zip
+
+## Local developer setup / AI config
+/opencode.json
+/AGENTS.md
+/WORKSTATE_NOTES.md
+/do_build_d.bat
+/try_build.bat
+
+## Stray diagnostic dumps left at repo root
+/disasm.txt
+/pdb_*.txt
+/cmake_output.txt
+
 ## AI assistant config (user-specific)
 /.claude/
 /CLAUDE.md

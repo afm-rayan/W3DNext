@@ -281,6 +281,8 @@ void W3DTerrainVisual::init()
 //-------------------------------------------------------------------------------------------------
 void W3DTerrainVisual::reset()
 {
+	m_propRecords.clear();
+	m_rebuildingProps = false;
 
 	// extend
 	TerrainVisual::reset();
@@ -1088,6 +1090,49 @@ void W3DTerrainVisual::addProp(const ThingTemplate *tTemplate, const Coord3D *po
 	if (m_terrainRenderObject && modelName.isNotEmpty()) {
 		m_terrainRenderObject->addProp(1, *pos, angle, scale, modelName);
 	}
+	// W3DNext: remember props so they can be rebuilt when day/night bucket changes
+	if (!m_rebuildingProps && tTemplate && pos) {
+		m_propRecords.push_back({tTemplate, *pos, angle});
+	}
+}
+
+void W3DTerrainVisual::rebuildPropsForTimeOfDay()
+{
+	if (!m_terrainRenderObject || m_propRecords.empty() || m_rebuildingProps) return;
+	m_rebuildingProps = true;
+	m_terrainRenderObject->removeAllProps();
+	// re-add with current m_timeOfDay (getBestModelNameForWB will pick night variant)
+	for (auto &r : m_propRecords) {
+		// call the full addProp logic but avoid double-push
+		ModelConditionFlags state;
+		state.clear();
+		if (TheGlobalData->m_weather == WEATHER_SNOWY) state.set(MODELCONDITION_SNOW);
+		if (TheGlobalData->m_timeOfDay == TIME_OF_DAY_NIGHT) state.set(MODELCONDITION_NIGHT);
+		AsciiString modelName;
+		Real scale = r.tmpl->getAssetScale();
+		const ModuleInfo& mi = r.tmpl->getDrawModuleInfo();
+		if (mi.getCount() > 0) {
+			const ModuleData* mdd = mi.getNthData(0);
+			const W3DModelDrawModuleData* md = mdd ? mdd->getAsW3DModelDrawModuleData() : nullptr;
+			if (md) modelName = md->getBestModelNameForWB(state);
+		}
+		if (modelName.isNotEmpty()) m_terrainRenderObject->addProp(1, r.pos, r.angle, scale, modelName);
+	}
+	m_rebuildingProps = false;
+	FILE *fl = std::fopen("C:\\Users\\AFMRAYAN\\AppData\\Local\\Temp\\opencode\\unitnorm_toggle.log", "a");
+	if (fl) { std::fprintf(fl, "[D3D11] rebuildPropsForTimeOfDay tod=%d count=%d\n", (int)TheGlobalData->m_timeOfDay, (int)m_propRecords.size()); std::fclose(fl); }
+}
+
+// Free helper called from W3DDisplay when the day/night bucket flips.
+void W3DNext_RebuildTerrainPropsForTimeOfDay()
+{
+	FILE *fl0 = std::fopen("C:\\Users\\AFMRAYAN\\AppData\\Local\\Temp\\opencode\\unitnorm_toggle.log", "a");
+	if (fl0) { std::fprintf(fl0, "[D3D11] W3DNext_RebuildTerrainPropsForTimeOfDay called TheTerrainVisual=%p\n", (void*)TheTerrainVisual); std::fclose(fl0); }
+	if (!TheTerrainVisual) return;
+	W3DTerrainVisual* wt = dynamic_cast<W3DTerrainVisual*>(TheTerrainVisual);
+	FILE *fl1 = std::fopen("C:\\Users\\AFMRAYAN\\AppData\\Local\\Temp\\opencode\\unitnorm_toggle.log", "a");
+	if (fl1) { std::fprintf(fl1, "[D3D11] dynamic_cast wt=%p\n", (void*)wt); std::fclose(fl1); }
+	if (wt) wt->rebuildPropsForTimeOfDay();
 }
 
 // ------------------------------------------------------------------------------------------------

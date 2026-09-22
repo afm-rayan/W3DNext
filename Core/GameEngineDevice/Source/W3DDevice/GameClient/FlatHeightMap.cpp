@@ -162,6 +162,19 @@ m_updateState(STATE_IDLE)
 	TheFlatHeightMap = this;
 }
 
+//=============================================================================
+// FlatHeightMapRenderObjClass::IsTileCulled
+//=============================================================================
+/** Check if a terrain tile is culled (not visible) - for frustum culling optimization. */
+Bool FlatHeightMapRenderObjClass::IsTileCulled(Int x, Int y) const
+{
+	if (x < 0 || y < 0 || x >= m_tilesWidth || y >= m_tilesHeight) {
+		return true;
+	}
+	W3DTerrainBackground *tile = m_tiles + y * m_tilesWidth + x;
+	return tile->isCulled();
+}
+
 
 //=============================================================================
 // FlatHeightMapRenderObjClass::adjustTerrainLOD
@@ -542,6 +555,24 @@ void FlatHeightMapRenderObjClass::Render(RenderInfoClass & rinfo)
  	W3DShaderManager::setTexture(1,nullptr);	// Set by the tile later. [3/31/2003]
  	W3DShaderManager::setTexture(2,m_stageTwoTexture);	//cloud
  	W3DShaderManager::setTexture(3,m_stageThreeTexture);//noise
+		// W3DNext D3D11 terrain normal-mapping: when a normal map is present and
+		// lightmapping is on, switch to the HLSL terrain normal shader.
+		// The night lightmap/ambient are grayscaled inside the HLSL.
+		static const bool s_d3d11TerrainNormalEnabled = [] {
+			const char * e = W3DNext_GetEnv("D3D11_TERRAIN_NORMAL");
+			return e == nullptr || e[0] != '0';
+		}();
+		if (Is_D3D11_Backend_Active() && s_d3d11TerrainNormalEnabled
+			&& st != W3DShaderManager::ST_FLAT_TERRAIN_BASE
+			&& !ShaderClass::Is_Backface_Culling_Inverted()
+			&& m_map && m_map->hasNormalMap() && TheGlobalData->m_useLightMap)
+		{
+			TextureClass *normalTex = m_map->getNormalTerrainTexture();
+			if (normalTex != NULL) {
+				st = W3DShaderManager::ST_TERRAIN_NORMAL;
+				W3DShaderManager::setTexture(1, normalTex);	//normal atlas on slot1
+			}
+		}
 	//Disable writes to destination alpha channel (if there is one)
 	if (DX8Wrapper::getBackBufferFormat() == WW3D_FORMAT_A8R8G8B8) {
 		DX8Wrapper::Set_DX8_Render_State(D3DRS_COLORWRITEENABLE,D3DCOLORWRITEENABLE_BLUE|D3DCOLORWRITEENABLE_GREEN|D3DCOLORWRITEENABLE_RED);

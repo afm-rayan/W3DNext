@@ -1,0 +1,23 @@
+cmake_minimum_required(VERSION 3.24.0...4.0.1)
+
+project(milesaudio VERSION 1.0.0 LANGUAGES C)
+
+option(MILES_NOFLOAT "Don't use float for some volume functions." OFF)
+
+add_library(milescleanup STATIC cleanup.c)
+add_library(milesstub SHARED miles.c)
+set_target_properties(milesstub PROPERTIES OUTPUT_NAME mss32)
+set_target_properties(milesstub PROPERTIES SOVERSION 1.0 VERSION 1.0.0)
+if(WIN32)
+    set_target_properties(milesstub PROPERTIES PREFIX "")
+endif()
+target_include_directories(milesstub PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>      #include <mss/mss.h>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/mss>  #include <mss.h>
+)
+target_compile_definitions(milesstub PRIVATE BUILD_STUBS _CRT_SECURE_NO_WARNINGS)
+target_link_libraries(milesstub INTERFACE milescleanup)
+
+if(MILES_NOFLOAT)
+    target_compile_definitions(milesstub PUBLIC MILES_NOFLOAT)
+endif()

@@ -593,9 +593,19 @@ void BaseHeightMapRenderObjClass::doTheLight(VERTEX_FORMAT *vb, Vector3*light, V
 	{	//height is below water level
 		//reduce lighting values based on light fall off as it travels through water.
 		float depthScale = (1.4f - vb->z)/TheGlobalData->m_waterPositionZ;
-		shadeR *= 1.0f - depthScale * (1.0f-m_depthFade.X);
-		shadeG *= 1.0f - depthScale * (1.0f-m_depthFade.Y);
-		shadeB *= 1.0f - depthScale * (1.0f-m_depthFade.Z);
+		if (depthScale > 1.0f) depthScale = 1.0f;
+		float fadeR = 1.0f - depthScale * (1.0f-m_depthFade.X);
+		float fadeG = 1.0f - depthScale * (1.0f-m_depthFade.Y);
+		float fadeB = 1.0f - depthScale * (1.0f-m_depthFade.Z);
+		if (fadeR < 0.25f) fadeR = 0.25f;
+		if (fadeG < 0.25f) fadeG = 0.25f;
+		if (fadeB < 0.25f) fadeB = 0.25f;
+		shadeR *= fadeR;
+		shadeG *= fadeG;
+		shadeB *= fadeB;
+		if (shadeR < 0.0f) shadeR = 0.0f;
+		if (shadeG < 0.0f) shadeG = 0.0f;
+		if (shadeB < 0.0f) shadeB = 0.0f;
 	}
 
 	shadeR*=255.0f;
@@ -2505,7 +2515,7 @@ void BaseHeightMapRenderObjClass::renderShoreLines(CameraClass *pCamera)
 					vb->nx=0;	//filling these to keep AGP write buffer happy.
 					vb->ny=0;
 					vb->nz=0;
-					vb->diffuse=0;
+					vb->diffuse=0xFF000000;	//W3DNext: alpha=1 so the feather gradient comes from the texture's alpha (RGB is black - only dest ALPHA is written here)
 					vb->u1=shoreInfo->t0;
 					vb->v1=0;
 					vb->u2=0;
@@ -2518,7 +2528,7 @@ void BaseHeightMapRenderObjClass::renderShoreLines(CameraClass *pCamera)
 					vb->nx=0;	//filling these to keep AGP write buffer happy.
 					vb->ny=0;
 					vb->nz=0;
-					vb->diffuse=0;
+					vb->diffuse=0xFF000000;	//W3DNext: alpha=1 so the feather gradient comes from the texture's alpha (RGB is black - only dest ALPHA is written here)
 					vb->u1=shoreInfo->t1;
 					vb->v1=0;
 					vb->u2=0;
@@ -2531,7 +2541,7 @@ void BaseHeightMapRenderObjClass::renderShoreLines(CameraClass *pCamera)
 					vb->nx=0;	//filling these to keep AGP write buffer happy.
 					vb->ny=0;
 					vb->nz=0;
-					vb->diffuse=0;
+					vb->diffuse=0xFF000000;	//W3DNext: alpha=1 so the feather gradient comes from the texture's alpha (RGB is black - only dest ALPHA is written here)
 					vb->u1=shoreInfo->t2;
 					vb->v1=0;
 					vb->u2=0;
@@ -2544,7 +2554,7 @@ void BaseHeightMapRenderObjClass::renderShoreLines(CameraClass *pCamera)
 					vb->nx=0;	//filling these to keep AGP write buffer happy.
 					vb->ny=0;
 					vb->nz=0;
-					vb->diffuse=0;
+					vb->diffuse=0xFF000000;	//W3DNext: alpha=1 so the feather gradient comes from the texture's alpha (RGB is black - only dest ALPHA is written here)
 					vb->u1=shoreInfo->t3;
 					vb->v1=0;
 					vb->u2=0;
@@ -2718,7 +2728,7 @@ void BaseHeightMapRenderObjClass::renderShoreLinesSorted(CameraClass *pCamera)
 						vb->nx=0;	//filling these to keep AGP write buffer happy.
 						vb->ny=0;
 						vb->nz=0;
-						vb->diffuse=0;
+						vb->diffuse=0xFF000000;	//W3DNext: alpha=1 so the feather gradient comes from the texture's alpha (RGB is black - only dest ALPHA is written here)
 						vb->u1=shoreInfo->t0;
 						vb->v1=0;
 						vb->u2=0;
@@ -2731,7 +2741,7 @@ void BaseHeightMapRenderObjClass::renderShoreLinesSorted(CameraClass *pCamera)
 						vb->nx=0;	//filling these to keep AGP write buffer happy.
 						vb->ny=0;
 						vb->nz=0;
-						vb->diffuse=0;
+						vb->diffuse=0xFF000000;	//W3DNext: alpha=1 so the feather gradient comes from the texture's alpha (RGB is black - only dest ALPHA is written here)
 						vb->u1=shoreInfo->t1;
 						vb->v1=0;
 						vb->u2=0;
@@ -2744,7 +2754,7 @@ void BaseHeightMapRenderObjClass::renderShoreLinesSorted(CameraClass *pCamera)
 						vb->nx=0;	//filling these to keep AGP write buffer happy.
 						vb->ny=0;
 						vb->nz=0;
-						vb->diffuse=0;
+						vb->diffuse=0xFF000000;	//W3DNext: alpha=1 so the feather gradient comes from the texture's alpha (RGB is black - only dest ALPHA is written here)
 						vb->u1=shoreInfo->t2;
 						vb->v1=0;
 						vb->u2=0;
@@ -2757,7 +2767,7 @@ void BaseHeightMapRenderObjClass::renderShoreLinesSorted(CameraClass *pCamera)
 						vb->nx=0;	//filling these to keep AGP write buffer happy.
 						vb->ny=0;
 						vb->nz=0;
-						vb->diffuse=0;
+						vb->diffuse=0xFF000000;	//W3DNext: alpha=1 so the feather gradient comes from the texture's alpha (RGB is black - only dest ALPHA is written here)
 						vb->u1=shoreInfo->t3;
 						vb->v1=0;
 						vb->u2=0;
@@ -2839,7 +2849,7 @@ flushVertexBuffer0:
 						vb->nx=0;	//filling these to keep AGP write buffer happy.
 						vb->ny=0;
 						vb->nz=0;
-						vb->diffuse=0;
+						vb->diffuse=0xFF000000;	//W3DNext: alpha=1 so the feather gradient comes from the texture's alpha (RGB is black - only dest ALPHA is written here)
 						vb->u1=shoreInfo->t0;
 						vb->v1=0;
 						vb->u2=0;
@@ -2852,7 +2862,7 @@ flushVertexBuffer0:
 						vb->nx=0;	//filling these to keep AGP write buffer happy.
 						vb->ny=0;
 						vb->nz=0;
-						vb->diffuse=0;
+						vb->diffuse=0xFF000000;	//W3DNext: alpha=1 so the feather gradient comes from the texture's alpha (RGB is black - only dest ALPHA is written here)
 						vb->u1=shoreInfo->t1;
 						vb->v1=0;
 						vb->u2=0;
@@ -2865,7 +2875,7 @@ flushVertexBuffer0:
 						vb->nx=0;	//filling these to keep AGP write buffer happy.
 						vb->ny=0;
 						vb->nz=0;
-						vb->diffuse=0;
+						vb->diffuse=0xFF000000;	//W3DNext: alpha=1 so the feather gradient comes from the texture's alpha (RGB is black - only dest ALPHA is written here)
 						vb->u1=shoreInfo->t2;
 						vb->v1=0;
 						vb->u2=0;
@@ -2878,7 +2888,7 @@ flushVertexBuffer0:
 						vb->nx=0;	//filling these to keep AGP write buffer happy.
 						vb->ny=0;
 						vb->nz=0;
-						vb->diffuse=0;
+						vb->diffuse=0xFF000000;	//W3DNext: alpha=1 so the feather gradient comes from the texture's alpha (RGB is black - only dest ALPHA is written here)
 						vb->u1=shoreInfo->t3;
 						vb->v1=0;
 						vb->u2=0;

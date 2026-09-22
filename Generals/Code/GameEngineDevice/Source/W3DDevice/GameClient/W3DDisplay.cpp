@@ -100,6 +100,7 @@ static void drawFramerateBar();
 #include "WW3D2/meshmdl.h"
 #include "WW3D2/rddesc.h"
 #include "WW3D2/Backend/RenderBackend.h"
+#include "WW3D2/Backend/D3D11Backend.h"
 #include "TARGA.h"
 
 #include "GameLogic/ScriptEngine.h"		// For TheScriptEngine - jkmcd
@@ -1898,6 +1899,14 @@ AGAIN:
 
 				// draw all views of the world
 				drawViews();
+
+				// W3DNext: color grade AFTER the 3D scene, BEFORE the 2D UI.
+				if (Is_D3D11_Backend_Active()) {
+					D3D11Backend * d3d = static_cast<D3D11Backend *>(g_renderBackend);
+					if (d3d->Is_Grade_Enabled()) {
+						d3d->Apply_Color_Grade();
+					}
+				}
 
 				// draw the user interface
 				TheInGameUI->DRAW();

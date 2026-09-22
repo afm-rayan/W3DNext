@@ -44,6 +44,7 @@
 #include "scene.h"
 #include "dx8wrapper.h"
 #include "Backend/RenderBackend.h"
+#include "Backend/D3D11Backend.h"
 #include "light.h"
 #include "d3dx8math.h"
 #include "simplevec.h"
@@ -67,6 +68,10 @@
 #include "W3DDevice/GameClient/W3DPoly.h"
 #include "W3DDevice/GameClient/W3DScene.h"
 #include "W3DDevice/GameClient/W3DCustomScene.h"
+
+#include <cstdio>
+#include <cstdarg>
+#include <windows.h>
 
 
 
@@ -93,7 +98,7 @@
 #define PATCH_SIZE 15		//number of vertices on patch edge.  Large patches may waste vertices off edge of screen.
 #define PATCH_UV_TILES	42	//number of times the bump map texture is tiled across patch (must be integer!).
 #define PATCH_SCALE (4.0f * MAP_XY_FACTOR)	//horizontal scale factor. Adjust this and size to get desired vertex density.
-#define SEA_REFLECTION_SIZE 256		//dimensions of reflection texture
+#define SEA_REFLECTION_SIZE 512		//dimensions of reflection texture (was 256; modern GPUs afford the sharper reflection)
 
 #define SEA_BUMP_SCALE		(0.06f)		//scales the du/dv offsets stored in bump map (~ amount to perturb)
 #define BUMP_SIZE (50.f)
@@ -885,6 +890,22 @@ void WaterRenderObjClass::ReAcquireResources()
 			return;
 	}
 	else
+	if (Is_D3D11_Backend_Active())
+	{
+		// D3D11: skip the legacy DX8 wave.pso/wave.vso binary shader load below
+		// entirely - kWaterPixelShaderHLSL (D3D11FFShaders.h) replaces it, and
+		// those DX8-era compiled shader blobs cannot load on this backend
+		// anyway. That failed load used to 'return' BEFORE reaching
+		// Create_Render_Target below, so m_pReflectionTexture was NEVER
+		// created for any water body - the root cause of "no object
+		// reflections on water" (renderMirror() had nowhere to render into).
+		// Always create it now: modern GPUs trivially afford one extra
+		// 256x256 mirror pass, so every water body gets real reflections
+		// instead of only the historically "high-end" WATER_TYPE_2_PVSHADER
+		// bodies (a circa-2003 performance restriction that no longer applies).
+		m_pReflectionTexture = DX8Wrapper::Create_Render_Target (SEA_REFLECTION_SIZE, SEA_REFLECTION_SIZE);
+	}
+	else
 	if (m_waterType == WATER_TYPE_2_PVSHADER)
 	{	//pixel/vertex shader based water assets.
 		if (FAILED(hr=generateIndexBuffer(PATCH_SIZE,PATCH_SIZE)))
@@ -1431,9 +1452,50 @@ void WaterRenderObjClass::loadSetting( Setting *setting, TimeOfDay timeOfDay )
 	*	textures need to be updated before we start rendering to the main screen
 	* render target because D3D doesn't multiple render targets. */
 //-------------------------------------------------------------------------------------------------
+
+// TEMP MIRROR DIAGNOSTICS (remove after crash root-cause). Provides a stage log
+// plus a SEH guard around the mirror render so a crash writes both the exact
+// call stage and a raw backtrace instead of silently dying.
+static volatile int s_mirrorStage = 0;
+static volatile int s_mirrorSavedDiagMode = -1;
+static _EXCEPTION_POINTERS* s_mirrorExcInfo = nullptr;
+
+static void MirrorDiagLog(const char* fmt, ...)
+{
+	FILE* f = fopen("water_mirror.log", "a");
+	if (f == nullptr) {
+		return;
+	}
+	va_list args;
+	va_start(args, fmt);
+	vfprintf(f, fmt, args);
+	va_end(args);
+	fprintf(f, "\n");
+	fflush(f);
+	fclose(f);
+}
+
+static void MirrorDiagBacktrace()
+{
+	void* frames[32];
+	USHORT n = CaptureStackBackTrace(0, 32, frames, nullptr);
+	for (USHORT i = 0; i < n; ++i) {
+		MirrorDiagLog("\t%02u: 0x%p", i, frames[i]);
+	}
+}
+
 void WaterRenderObjClass::updateRenderTargetTextures(CameraClass *cam)
 {
-	if (m_waterType == WATER_TYPE_2_PVSHADER && getClippedWaterPlane(cam, nullptr) &&
+	// Under D3D11 the reflection RTT is now always created (see
+	// ReAcquireResources), so render into it for every water body, not just
+	// the historically "high-end" WATER_TYPE_2_PVSHADER ones - that gate was
+	// a circa-2003 performance restriction (an extra 256x256 mirror pass) that
+	// modern GPUs don't need. The legacy DX8 path is left exactly as it was.
+	// TEMP MIRROR DIAGNOSTICS: mirror re-enabled, guarded by SEH + stage log.
+	const bool shouldRenderMirror = Is_D3D11_Backend_Active()
+		? (m_pReflectionTexture != nullptr)
+		: (m_waterType == WATER_TYPE_2_PVSHADER);
+	if (shouldRenderMirror && getClippedWaterPlane(cam, nullptr) &&
 		TheTerrainRenderObject && TheTerrainRenderObject->getMap())
 		renderMirror(cam);	//generate texture containing reflected scene
 }
@@ -1476,44 +1538,96 @@ void WaterRenderObjClass::renderMirror(CameraClass *cam)
 	//generate a new camera matrix from reflected vectors
 	Matrix3D reflectedTransform(rRight,rUp,rN,rPos);
 
+	// TEMP MIRROR DIAGNOSTICS: stage log + SEH guard around the whole mirror
+	// render so a crash records the exact stage and a raw backtrace instead of
+	// silently killing the process.
+	s_mirrorStage = 0;
+	MirrorDiagLog("=== mirror begin (level %f) %p ===", m_level, cam);
 
-	g_renderBackend->Set_Render_Target_With_Z((TextureClass*)m_pReflectionTexture);
+	__try
+	{
+		s_mirrorStage = 1;
+		MirrorDiagLog("mirror stage 1: Set_Render_Target_With_Z");
+		g_renderBackend->Set_Render_Target_With_Z((TextureClass*)m_pReflectionTexture);
 
-	// Clear the backbuffer
-	WW3D::Begin_Render(false,true,Vector3(0.0f,0.0f,0.0f));	//clearing only z-buffer since background always filled with clouds
+		// Reflected scene must render WITHOUT the unit-normal pass: otherwise the
+		// normal-map shader runs on reflected units and writes normal-map-RGB blocks
+		// into the reflection texture, which the water surface then samples -> the
+		// rainbow "WaterPlane" floating above the surface + mosaic/half-alpha black
+		// seams on the ground. g_w3dnextDiagMode==3 is "unit normalmap OFF" (only),
+		// so forcing it here yields the clean diffuse-only reflection Generals used.
+		int savedWaterDiag = g_w3dnextDiagMode;
+		s_mirrorSavedDiagMode = savedWaterDiag;
+		g_w3dnextDiagMode = 3;
 
-	cam->Set_Transform( reflectedTransform );
+		// Clear the backbuffer
+		s_mirrorStage = 2;
+		MirrorDiagLog("mirror stage 2: Begin_Render");
+		WW3D::Begin_Render(false,true,Vector3(0.0f,0.0f,0.0f));	//clearing only z-buffer since background always filled with clouds
 
-	//Force reflected image to be drawn into full texture size - not a viewport inside texture.
-	Vector2 vMin,vMax,vOldMax,vOldMin;
- 	cam->Get_Viewport(vOldMin,vOldMax);
- 	vMax.X=vMax.Y=1.0f;
-	vMin.X=vMin.Y=0.0f;
- 	cam->Set_Viewport(vMin,vMax);
+		cam->Set_Transform( reflectedTransform );
 
-	cam->Apply();	//force an update of all the camera dependent parameters like frustum clip planes
+		//Force reflected image to be drawn into full texture size - not a viewport inside texture.
+		Vector2 vMin,vMax,vOldMax,vOldMin;
+	 	cam->Get_Viewport(vOldMin,vOldMax);
+	 	vMax.X=vMax.Y=1.0f;
+		vMin.X=vMin.Y=0.0f;
+	 	cam->Set_Viewport(vMin,vMax);
 
-	//flip the winding order of polygons to draw the reflected back sides.
-	ShaderClass::Invert_Backface_Culling(true);
+		s_mirrorStage = 3;
+		MirrorDiagLog("mirror stage 3: cam->Apply");
+		cam->Apply();	//force an update of all the camera dependent parameters like frustum clip planes
 
-	// Render the scene
-	renderSky();
-	if (m_tod == TIME_OF_DAY_NIGHT)
-		renderSkyBody(&reflectedTransform);
+		//flip the winding order of polygons to draw the reflected back sides.
+		ShaderClass::Invert_Backface_Culling(true);
 
-	WW3D::Render(m_parentScene,cam);
+		// Render the scene
+		s_mirrorStage = 4;
+		MirrorDiagLog("mirror stage 4: sky");
+		renderSky();
+		if (m_tod == TIME_OF_DAY_NIGHT)
+			renderSkyBody(&reflectedTransform);
 
-	cam->Set_Transform(OldCameraMatrix);	//restore original non-reflected matrix
- 	cam->Set_Viewport(vOldMin,vOldMax);
+		s_mirrorStage = 5;
+		MirrorDiagLog("mirror stage 5: WW3D::Render scene");
+		WW3D::Render(m_parentScene,cam);
 
-	cam->Apply();	//force an update of all the camera dependent parameters like frustum clip planes
+		cam->Set_Transform(OldCameraMatrix);	//restore original non-reflected matrix
+	 	cam->Set_Viewport(vOldMin,vOldMax);
 
-	ShaderClass::Invert_Backface_Culling(false);
+		cam->Apply();	//force an update of all the camera dependent parameters like frustum clip planes
 
-	WW3D::End_Render(false);
+		ShaderClass::Invert_Backface_Culling(false);
 
-	// Change the rendertarget back to the main backbuffer
-	DX8Wrapper::Set_Render_Target((IDirect3DSurface8 *)nullptr);
+		s_mirrorStage = 6;
+		MirrorDiagLog("mirror stage 6: End_Render");
+		WW3D::End_Render(false);
+
+		g_w3dnextDiagMode = savedWaterDiag; // restore (e.g. unit normals back ON in mode 0)
+		s_mirrorSavedDiagMode = -1;
+
+		// Change the rendertarget back to the main backbuffer
+		// Fix for D3D11 backend: use the render backend's render target restore
+		// instead of DX8Wrapper, which doesn't properly restore the D3D11 backbuffer
+		// leading to a broken viewport (small rectangle, black elsewhere).
+		g_renderBackend->Set_Render_Target_With_Z(nullptr, nullptr);
+		s_mirrorStage = 0;
+		MirrorDiagLog("mirror: ok");
+	}
+	__except(s_mirrorExcInfo = GetExceptionInformation(), EXCEPTION_EXECUTE_HANDLER)
+	{
+		const DWORD code = s_mirrorExcInfo ? s_mirrorExcInfo->ExceptionRecord->ExceptionCode : 0;
+		void* const excAddr = s_mirrorExcInfo ? s_mirrorExcInfo->ExceptionRecord->ExceptionAddress : nullptr;
+		MirrorDiagLog("=== MIRROR CRASH stage=%d code=0x%X addr=%p ===", (int)s_mirrorStage, code, excAddr);
+		MirrorDiagBacktrace();
+		if (s_mirrorSavedDiagMode != -1) {
+			g_w3dnextDiagMode = (int)s_mirrorSavedDiagMode;
+			s_mirrorSavedDiagMode = -1;
+		}
+		g_renderBackend->Set_Render_Target_With_Z(nullptr, nullptr);
+		s_mirrorStage = 0;
+		MirrorDiagLog("=== mirror handler done (crash swallowed for diagnostics) ===");
+	}
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -1532,6 +1646,11 @@ void WaterRenderObjClass::renderMirror(CameraClass *cam)
 void WaterRenderObjClass::Render(RenderInfoClass & rinfo)
 {
 	//USE_PERF_TIMER(Water)
+	// W3DNext D3D11 diagnostic: disable all water in diag modes 1 and 4 so we can
+	// tell whether the white-flash/halo artifact comes from the water path.
+	if (g_w3dnextDiagMode == 1 || g_w3dnextDiagMode == 4) {
+		return;
+	}
 	if (TheTerrainRenderObject && !TheTerrainRenderObject->getMap())
 		return;	//no map has been loaded yet.
 
@@ -1571,7 +1690,15 @@ void WaterRenderObjClass::Render(RenderInfoClass & rinfo)
 			break;
 
 		case WATER_TYPE_2_PVSHADER:
-			//Pixel/Vertex Shader based water which uses an off-screen rendered reflection texture
+			// The D3D11 backend has no D3D8 vertex/pixel-shader or render-to-texture
+			// reflection support, so drawSea() (which relies on both) renders the sea
+			// white/washed. Fall back to the fixed-function water path (same as
+			// WATER_TYPE_0) that the D3D11 backend already renders correctly
+			// (translucent tiles, no reflection). DX8 keeps the real shader-based sea.
+			if (Is_D3D11_Backend_Active()) {
+				renderWater();
+				break;
+			}
 			drawSea(rinfo);	//draw water surface
 			break;
 
@@ -1802,6 +1929,24 @@ void WaterRenderObjClass::drawSea(RenderInfoClass & rinfo)
 
 	if (!getClippedWaterPlane(&rinfo.Camera,&seaBox))
 		return;	//the sea is not visible
+
+	if (Is_D3D11_Backend_Active()) {
+		// D3D11 FIX: drawSea drives the water surface with its own D3D8 stage states
+		// and m_pDev->SetPixelShader(m_dwWavePixelShader). On the D3D11 backend the
+		// legacy ps.1.1 handle is a no-op, so if the unit-normal pass left
+		// PS_UnitNormal bound (mode 0 / diag 0/2) it LEAKS into this draw: PS_UnitNormal
+		// then samples stage 0 (the U8V8 water bump, stage 0) as gBase -> the
+		// rainbow/iridescent "WaterPlane" shimmer, and the surface reads the bump as
+		// a colour source. Mode 3/4 never enable the unit-normal pass, so drawSea's
+		// no-op SetPixelShader leaves the FF combiner and the water renders cleanly.
+		// Force that exact clean state here for every diag mode so the water surface
+		// is never painted with the unit shader. (RenderMirror already wraps the
+		// reflection in mode 3; this covers the main surface draw itself.)
+		DX8Wrapper::Set_Unit_Normal_Enable(false);
+		if (D3D11Backend * be = static_cast<D3D11Backend *>(g_renderBackend)) {
+			be->Set_Terrain_Normal_Pixel_Shader(false); be->Set_Unit_Normal_Pixel_Shader(false);
+		}
+	}
 
 	D3DXMATRIX matProj, matView, matWW3D;
 
@@ -2034,13 +2179,18 @@ void WaterRenderObjClass::renderWater()
 					{
 						for (int r = 0; r < TheGlobalData->m_featherWater; ++r)
 						{
-							drawTrapezoidWater(points);
+							// Inner layers (r==0) stay full-strength, outer layers
+							// fade toward the shore so the water edge dissolves instead
+							// of a hard alpha clip. Combined with the DESTALPHA blend in
+							// drawTrapezoidWater this is the soft-shoreline alpha.
+							float layerAlpha = 1.0f - (float)r / (float)TheGlobalData->m_featherWater;
+							drawTrapezoidWater(points, layerAlpha);
 							points[0].Z += (FEATHER_THICKNESS/TheGlobalData->m_featherWater);
 						}
 					}
 
 					else
-						drawTrapezoidWater(points);
+						drawTrapezoidWater(points, 1.0f);
 
 
 				}
@@ -2059,7 +2209,17 @@ void WaterRenderObjClass::renderSky()
 	Int timeNow,timeDiff;
 	Real fu,fv;
 
-	Setting *setting=&m_settings[m_tod];
+	// W3DNext day/night cycle: blend between the two adjacent time-of-day sky
+	// settings so the sky crossfades continuously instead of popping textures
+	// at bucket flips. Scroll offsets always follow the A setting for
+	// continuity. Cycle disabled -> dncBlend false -> exact legacy behaviour.
+	Int dncA = m_tod, dncB = m_tod;
+	Real dncT = 0.0f;
+	const bool dncBlend = W3DNextDayCycleGetPhase(dncA, dncB, dncT)
+		&& dncA >= TIME_OF_DAY_FIRST && dncA < TIME_OF_DAY_COUNT
+		&& dncB >= TIME_OF_DAY_FIRST && dncB < TIME_OF_DAY_COUNT;
+
+	Setting *setting=&m_settings[dncA];
 
 	timeNow=timeGetTime();
 
@@ -2134,7 +2294,62 @@ void WaterRenderObjClass::renderSky()
 	tm.Set_Translation(Vector3(0,0,0));
 	g_renderBackend->Set_Transform(RB_TRANSFORM_WORLD,tm);
 
-	g_renderBackend->Draw_Triangles(	0,2, 0,	4);	//draw a quad, 2 triangles, 4 verts
+	// Base pass: the A sky, skipped when the crossfade is fully onto B.
+	if (!dncBlend || dncT < 0.98f)
+	{
+		g_renderBackend->Draw_Triangles(	0,2, 0,	4);	//draw a quad, 2 triangles, 4 verts
+	}
+
+	// Crossfade pass: the B sky drawn with vertex alpha = t over the A pass,
+	// giving a smooth day<->night sky transition.
+	if (dncBlend && dncT > 0.02f)
+	{
+		ShaderClass fadeShader = m_shader2;
+		fadeShader.Set_Src_Blend_Func(ShaderClass::SRCBLEND_SRC_ALPHA);
+		fadeShader.Set_Dst_Blend_Func(ShaderClass::DSTBLEND_ONE_MINUS_SRC_ALPHA);
+		g_renderBackend->Set_Shader(fadeShader);
+		g_renderBackend->Set_Texture(0,m_settings[dncB].skyTexture);
+
+		DynamicVBAccessClass vb_fade(BUFFER_TYPE_DYNAMIC_DX8,dynamic_fvf_type,4);
+		{
+			DynamicVBAccessClass::WriteLockClass lock(&vb_fade);
+			VertexFormatXYZNDUV2* verts=lock.Get_Formatted_Vertex_Array();
+			if(verts)
+			{
+				const unsigned int fadeA = (unsigned int)(dncT * 255.0f) << 24;
+				const Setting * sB = &m_settings[dncB];
+				verts[0].x=-SKYPLANE_SIZE;
+				verts[0].y=SKYPLANE_SIZE;
+				verts[0].z=SKYPLANE_HEIGHT;
+				verts[0].u1=m_uOffset;
+				verts[0].v1=fv;
+				verts[0].diffuse=fadeA | (sB->vertex01Diffuse & 0x00FFFFFFu);
+
+				verts[1].x=SKYPLANE_SIZE;
+				verts[1].y=SKYPLANE_SIZE;
+				verts[1].z=SKYPLANE_HEIGHT;
+				verts[1].u1=fu;
+				verts[1].v1=fv;
+				verts[1].diffuse=fadeA | (sB->vertex11Diffuse & 0x00FFFFFFu);
+
+				verts[2].x=SKYPLANE_SIZE;
+				verts[2].y=-SKYPLANE_SIZE;
+				verts[2].z=SKYPLANE_HEIGHT;
+				verts[2].u1=fu;
+				verts[2].v1=m_vOffset;
+				verts[2].diffuse=fadeA | (sB->vertex10Diffuse & 0x00FFFFFFu);
+
+				verts[3].x=-SKYPLANE_SIZE;
+				verts[3].y=-SKYPLANE_SIZE;
+				verts[3].z=SKYPLANE_HEIGHT;
+				verts[3].u1=m_uOffset;
+				verts[3].v1=m_vOffset;
+				verts[3].diffuse=fadeA | (sB->vertex00Diffuse & 0x00FFFFFFu);
+			}
+		}
+		g_renderBackend->Set_Vertex_Buffer(vb_fade);
+		g_renderBackend->Draw_Triangles(	0,2, 0,	4);
+	}
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -2948,6 +3163,77 @@ void WaterRenderObjClass::setupFlatWaterShader()
 	else
 		g_renderBackend->Set_Shader(ShaderClass::_PresetAdditiveShader);
 
+	// D3D11 FIX: Set_Shader programs the FF *stage state* but never rebinds the
+	// pixel shader. If a unit-normal pass ran just before this water draw,
+	// PS_UnitNormal is still bound here and samples the water's stream-0 texture
+	// as gBase -> the green/red/yellow shimmer on the water tiles (it vanishes
+	// when water is toggled off; toggling normals off does nothing). Force the
+	// FF combiner pixel shader back on for the water surface, exactly as drawSea
+	// already does for the sea path (see drawSea, ~line 1843).
+	if (Is_D3D11_Backend_Active()) {
+		DX8Wrapper::Set_Unit_Normal_Enable(false);
+		// Restore the FF combiner pixel shader: a terrain/unit normal pass may have
+		// left its HLSL pixel shader bound, and sampling it against the water's
+		// stream-0 texture is the rainbow shimmer. BUT the shimmer you saw was
+		// actually the leaked terrain NORMAL/LIGHTMAP TEXTURES (t1/t2) surviving
+		// from the preceding terrain draw - disabling Art/-Terrain cured it. So the
+		// real fix is to clear those stale stages here too, before water binds its
+		// own textures below.
+		if (D3D11Backend * be = static_cast<D3D11Backend *>(g_renderBackend)) {
+			be->Set_Terrain_Normal_Pixel_Shader(false); be->Set_Unit_Normal_Pixel_Shader(false);
+			be->Bind_Neutral_Texture(1); // t1: drop leaked terrain normal/lightmap atlas
+			be->Bind_Neutral_Texture(2); // t2: drop leaked terrain lightmap
+			be->Bind_Neutral_Texture(3); // t3: drop leaked shroud/sparkle
+			// Set water shader constants for D3D11 custom water shader.
+			// Sun direction/colour now track the actual time-of-day terrain
+			// lighting (same TheGlobalData->m_terrainLighting + 
+			// W3DNextDayCycleGetPhase blend used for terrain in
+			// W3DShaderManager.cpp) instead of a fixed sunDir/sunColor - the
+			// water's sun glint used to stay pointed at a fixed spot all day
+			// even after the day/night cycle fix made the terrain's sun visibly
+			// move, which looked wrong (glint not tracking the sun).
+			GlobalData::TerrainLighting waterDncBlend;
+			const GlobalData::TerrainLighting *waterLight;
+			{
+				Int dncA = 0, dncB = 0;
+				Real dncT = 0.0f;
+				if (W3DNextDayCycleGetPhase(dncA, dncB, dncT)) {
+					const GlobalData::TerrainLighting &la = TheGlobalData->m_terrainLighting[dncA][0];
+					const GlobalData::TerrainLighting &lb = TheGlobalData->m_terrainLighting[dncB][0];
+					waterDncBlend = la;
+					waterDncBlend.diffuse.red   += (lb.diffuse.red   - la.diffuse.red)   * dncT;
+					waterDncBlend.diffuse.green += (lb.diffuse.green - la.diffuse.green) * dncT;
+					waterDncBlend.diffuse.blue  += (lb.diffuse.blue  - la.diffuse.blue)  * dncT;
+					waterDncBlend.lightPos.x += (lb.lightPos.x - la.lightPos.x) * dncT;
+					waterDncBlend.lightPos.y += (lb.lightPos.y - la.lightPos.y) * dncT;
+					waterDncBlend.lightPos.z += (lb.lightPos.z - la.lightPos.z) * dncT;
+					waterLight = &waterDncBlend;
+				} else {
+					waterLight = &TheGlobalData->m_terrainLighting[TheGlobalData->m_timeOfDay][0];
+				}
+			}
+			// lightPos matches the terrain convention in W3DShaderManager.cpp,
+			// which negates it to get the "toward the sun" direction (see
+			// Vector3 lightRay(-light->lightPos.x, ...) there). The water
+			// shader's L is used the same way - reflect(-L, waveN) expects L
+			// to point toward the sun - so the same negation is required here.
+			Vector3 sunDir(-waterLight->lightPos.x, -waterLight->lightPos.y, -waterLight->lightPos.z);
+			Vector3 sunColor(waterLight->diffuse.red, waterLight->diffuse.green, waterLight->diffuse.blue);
+			sunDir.Normalize();
+			// Reflection RTT is now always filled under D3D11 (see
+			// ReAcquireResources + updateRenderTargetTextures) - gate on its
+			// existence rather than the legacy WATER_TYPE_2_PVSHADER-only
+			// check, so river water gets real object reflections too.
+			be->Set_Water_Constants(sunDir, sunColor,
+				3.0f,   // bumpScale (was ~1.5, now ~3.0 for taller waves)
+				(m_pReflectionTexture != nullptr) ? 0.8f : 0.0f,   // reflectionFactor
+				0.9f,   // sunGlitter (stronger sun glint)
+				static_cast<float>(GetTickCount()) * 0.001f, // time in seconds
+				m_riverTexture ? m_riverTexture->Get_Width() : 800,
+				m_riverTexture ? m_riverTexture->Get_Height() : 600);
+		}
+	}
+
 	VertexMaterialClass *vmat=VertexMaterialClass::Get_Preset(VertexMaterialClass::PRELIT_DIFFUSE);
 	g_renderBackend->Set_Material(vmat);
 	REF_PTR_RELEASE(vmat);
@@ -3035,12 +3321,23 @@ void WaterRenderObjClass::setupFlatWaterShader()
 		DX8Wrapper::_Get_D3D_Device8()->SetPixelShaderConstant(0,   D3DXVECTOR4(REFLECTION_FACTOR, REFLECTION_FACTOR, REFLECTION_FACTOR, 1.0f), 1);
 		DX8Wrapper::_Get_D3D_Device8()->SetPixelShader(m_trapezoidWaterPixelShader);
 	}
+	// D3D11 FIX (final, authoritative restore): guarantee the FF combiner pixel
+	// shader is bound for the water draw that follows. The trapezoidPixelShader
+	// handle above is a no-op on the D3D11 backend (ps.1.1 is unimplemented), but
+	// restore here as well so the guarantee holds regardless of that, mirroring
+	// the drawSea guard that already protects the sea path.
+	if (Is_D3D11_Backend_Active()) {
+		DX8Wrapper::Set_Unit_Normal_Enable(false);
+		if (D3D11Backend * be = static_cast<D3D11Backend *>(g_renderBackend)) {
+			be->Set_Terrain_Normal_Pixel_Shader(false); be->Set_Unit_Normal_Pixel_Shader(false);
+		}
+	}
 }
 
 //-------------------------------------------------------------------------------------------------
 //Draw a 4 sided flat water area.
 //-------------------------------------------------------------------------------------------------
-void WaterRenderObjClass::drawTrapezoidWater(Vector3 points[4])
+void WaterRenderObjClass::drawTrapezoidWater(Vector3 points[4], float layerAlpha)
 {
 	Vector3 origin(points[0]);
 	Vector3 uVec1(points[1]);
@@ -3157,7 +3454,11 @@ void WaterRenderObjClass::drawTrapezoidWater(Vector3 points[4])
 		Real phase = 0;
 		Real mapCoeff = PI/(4*MAP_XY_FACTOR);
 		Real wave = 0;
-		Real amplitude = 0.5f;
+		// Wave depth/bonus: the U8V8 bump normal map is inert on the D3D11 backend
+		// (it falls back to the neutral checker), so the visible "normal map / wave
+		// strength" is driven by geometry wave height + the water-map UV ripple.
+		// Bumped from the legacy 0.5 to make the surface rippling/curling visibly.
+		Real amplitude = 0.9f;
 
 		//The first (high order) byte is the Alpha value for this patch
 		// It needs to be set proportional to the number of feather layers
@@ -3170,6 +3471,9 @@ void WaterRenderObjClass::drawTrapezoidWater(Vector3 points[4])
 		if ( TheGlobalData->m_featherWater == 3) Alpha = 140;
 		if ( TheGlobalData->m_featherWater == 2) Alpha = 200;
 		if ( TheGlobalData->m_featherWater == 1) Alpha = 255;
+		// Layer fade (soft shore): outer feather layers are pushed more translucent
+		// toward the terrain edge so the water dissolves instead of clipping hard.
+		Alpha = REAL_TO_INT(Alpha * layerAlpha);
 
 		//Keep diffuse from lighting calculations but substitute custom alpha
 		Int customDiffuse = (diffuse & 0x00ffffff) | (Alpha<< 24);//(0x80 << 16)|(0x90 << 8)|0xa0;
@@ -3195,7 +3499,7 @@ void WaterRenderObjClass::drawTrapezoidWater(Vector3 points[4])
 				wave = (sin(phase) - 1.0f) * amplitude;
 
 				vb->z = (vertex.Z + wave);
-				vb->diffuse = customDiffuse;
+				{ Real eX=du, eY=dv; if (1.0f-eX<eX) eX=1.0f-eX; if (1.0f-eY<eY) eY=1.0f-eY; Real ed=(eX<eY)?eX:eY; Real ef=ed/0.06f; if (ef>1.0f) ef=1.0f; ef=0.3f+0.7f*ef; Int ba=(customDiffuse>>24)&0xff; vb->diffuse=(customDiffuse&0x00ffffff)|((Int)REAL_TO_INT((Real)ba*ef)<<24); }
 				vb->u1 = (vertex.X/waterFactor) + 0.02*cos(11*m_riverVOrigin)*wave;
 				vb->v1 = (vertex.Y/waterFactor) + 0.02*cos(5*m_riverVOrigin)*wave;
 				vb->u2 = vertex.X/BUMP_SIZE;
@@ -3215,8 +3519,8 @@ void WaterRenderObjClass::drawTrapezoidWater(Vector3 points[4])
 		VertexFormatXYZNDUV2* vb=lock.Get_Formatted_Vertex_Array();
 
 		//Pulling some constants out of the inner loops to improve performance -MW
-		Real constA=0.02*cos(11*m_riverVOrigin);
-		Real constB=0.02*cos(5*m_riverVOrigin);
+		Real constA=0.05*cos(11*m_riverVOrigin);
+		Real constB=0.05*cos(5*m_riverVOrigin);
 		Real constC=25*m_riverVOrigin;
 		Real ooWaterFactor = 1.0f/waterFactor;
 		const Real constD=PI/(4*MAP_XY_FACTOR);
@@ -3239,7 +3543,7 @@ void WaterRenderObjClass::drawTrapezoidWater(Vector3 points[4])
 				vb->y=vertex.Y;
 				vb->z=vertex.Z;
 
-				vb->diffuse= diffuse;
+				{ Real eX=du, eY=dv; if (1.0f-eX<eX) eX=1.0f-eX; if (1.0f-eY<eY) eY=1.0f-eY; Real ed=(eX<eY)?eX:eY; Real ef=ed/0.06f; if (ef>1.0f) ef=1.0f; ef=0.3f+0.7f*ef; Int ba=(diffuse>>24)&0xff; vb->diffuse=(diffuse&0x00ffffff)|((Int)REAL_TO_INT((Real)ba*ef)<<24); }
 				//Old slower version
  				//vb->u1=(vertex.X/waterFactor) + 0.02*cos(11*m_riverVOrigin)*sin(25*m_riverVOrigin+vertex.X*PI/(4*MAP_XY_FACTOR));
  				//vb->v1=(vertex.Y/waterFactor) + 0.02*cos(5*m_riverVOrigin)*sin(25*m_riverVOrigin+vertex.Y*PI/(4*MAP_XY_FACTOR));
@@ -3300,8 +3604,84 @@ void WaterRenderObjClass::drawTrapezoidWater(Vector3 points[4])
 //			++vertBuf;
 //		}
 //#endif // FEATHER_WATER
-//#endif //WAVY_WATER
-		g_renderBackend->Draw_Triangles(	0,rectangleCount*2, 0,	(rectangleCount+1)*2);//lorenzen thinks this is where to itereate the soft shoreline effect
+	//#endif //WAVY_WATER
+		// D3D11: bind this water's textures + enable the reflection/surface pixel
+		// shader. Scoped to the lake draw only (river uses its own FF shader); the
+		// FF combiner was restored back in setupFlatWaterShader so no other pass is
+		// affected. Restored (and textures unbound) right after the draw below.
+		if (Is_D3D11_Backend_Active()) {
+			if (!m_waterNoiseTexture->Is_Initialized()) {
+				m_waterNoiseTexture->Init();
+			}
+			// Reflection RTT is now always filled under D3D11 (see
+			// ReAcquireResources + updateRenderTargetTextures) - gate on its
+			// existence rather than the legacy WATER_TYPE_2_PVSHADER-only
+			// check, so lake water gets real object reflections too. Falls
+			// back to reflectionFactor 0 (synthetic sky colour) only in the
+			// genuine edge case where the RTT failed to allocate.
+			const bool realReflection = (m_pReflectionTexture != nullptr);
+			g_renderBackend->Set_Texture(1, m_pReflectionTexture); // reflection RTT -> t1 (clamp)
+			g_renderBackend->Set_Texture(2, m_waterNoiseTexture);  // wave noise -> t2 (foam + glitter)
+			if (D3D11Backend * be = static_cast<D3D11Backend *>(g_renderBackend)) {
+				unsigned vw = be->Get_Viewport_Width();
+				unsigned vh = be->Get_Viewport_Height();
+				// Sun direction/colour tracks the actual time-of-day terrain
+				// lighting (same blend as the river path above) instead of a
+				// fixed Vector3(0.3,-0.6,0.7) - see the comment on the river
+				// path for why a fixed sun direction looks wrong once the
+				// day/night cycle visibly moves the sun.
+				GlobalData::TerrainLighting lakeDncBlend;
+				const GlobalData::TerrainLighting *lakeLight;
+				{
+					Int dncA = 0, dncB = 0;
+					Real dncT = 0.0f;
+					if (W3DNextDayCycleGetPhase(dncA, dncB, dncT)) {
+						const GlobalData::TerrainLighting &la = TheGlobalData->m_terrainLighting[dncA][0];
+						const GlobalData::TerrainLighting &lb = TheGlobalData->m_terrainLighting[dncB][0];
+						lakeDncBlend = la;
+						lakeDncBlend.diffuse.red   += (lb.diffuse.red   - la.diffuse.red)   * dncT;
+						lakeDncBlend.diffuse.green += (lb.diffuse.green - la.diffuse.green) * dncT;
+						lakeDncBlend.diffuse.blue  += (lb.diffuse.blue  - la.diffuse.blue)  * dncT;
+						lakeDncBlend.lightPos.x += (lb.lightPos.x - la.lightPos.x) * dncT;
+						lakeDncBlend.lightPos.y += (lb.lightPos.y - la.lightPos.y) * dncT;
+						lakeDncBlend.lightPos.z += (lb.lightPos.z - la.lightPos.z) * dncT;
+						lakeLight = &lakeDncBlend;
+					} else {
+						lakeLight = &TheGlobalData->m_terrainLighting[TheGlobalData->m_timeOfDay][0];
+					}
+				}
+				Vector3 lakeSunDir(-lakeLight->lightPos.x, -lakeLight->lightPos.y, -lakeLight->lightPos.z);
+				Vector3 lakeSunColor(lakeLight->diffuse.red, lakeLight->diffuse.green, lakeLight->diffuse.blue);
+				lakeSunDir.Normalize();
+				be->Set_Water_Constants(
+					lakeSunDir, lakeSunColor, // sun direction + tint (now time-of-day tracked)
+					0.02f, realReflection ? 0.6f : 0.0f, 0.7f, // bump/refl/glitter/time/viewport
+					(float)timeGetTime(), vw, vh);      // (refl=0 -> sky fallback only if RTT missing)
+				be->Set_Water_Pixel_Shader(true);
+			}
+		}
+			g_renderBackend->Draw_Triangles(	0,rectangleCount*2, 0,	(rectangleCount+1)*2);//lorenzen thinks this is where to itereate the soft shoreline effect
+	}
+	// D3D11: leave the water reflection pipeline (and its t1/t2/t3 textures) enabled
+	// only for the water draw. Restore the FF combiner + unbind the stages so the
+	// reflection/noise textures cannot leak into the post-water shroud pass (the
+	// "ground black / river purple" regression from over-broad binding).
+	if (Is_D3D11_Backend_Active()) {
+		if (D3D11Backend * be = static_cast<D3D11Backend *>(g_renderBackend)) {
+			be->Set_Water_Pixel_Shader(false);
+			be->Bind_Neutral_Texture(1);
+			be->Bind_Neutral_Texture(2);
+			be->Bind_Neutral_Texture(3);
+		}
+	}
+
+
+	// D3D11: restore the FF combiner after the water draw so the reflection pixel
+	// shader cannot leak into the post-water shroud pass.
+	if (Is_D3D11_Backend_Active()) {
+		if (D3D11Backend * be = static_cast<D3D11Backend *>(g_renderBackend)) {
+			be->Set_Water_Pixel_Shader(false);
+		}
 	}
 
 

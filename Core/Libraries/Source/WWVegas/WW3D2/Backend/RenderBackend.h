@@ -75,3 +75,13 @@ void Init_Render_Backend();
 // Destroy the render backend (calls its Shutdown() first). Must be called
 // before the render device is released. Safe to call if init never ran.
 void Shutdown_Render_Backend();
+
+// Diagnostic mode set by per-subsystem hotkeys polled by the D3D11 backend in
+// Begin_Scene (1=unit normalmap OFF, 2=screen filters OFF, 3=water OFF,
+// 4=ALL suspects OFF, F11=NORMAL/all on). Each press disables exactly one
+// suspect so the white-flash/halo artifact's source can be isolated in a
+// single keypress instead of cycling F11 four times. The value is mirrored to
+// diagmode.txt and a debug_snapshot_modeN.log is written per press.
+extern volatile int g_w3dnextDiagMode;
+void Set_W3DNext_Diag_Mode(int mode);
+const char * W3DNext_Diag_Mode_Name(int mode);

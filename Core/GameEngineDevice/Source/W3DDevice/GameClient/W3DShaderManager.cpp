@@ -55,6 +55,7 @@
 
 #include "dx8wrapper.h"
 #include "Backend/RenderBackend.h"
+#include "Backend/D3D11Backend.h"
 #include "assetmgr.h"
 #include "Lib/BaseType.h"
 #include "Common/file.h"
@@ -1669,8 +1670,28 @@ public:
 
 	void updateCloud();
 	void updateNoise1 (D3DXMATRIX *destMatrix,D3DXMATRIX *curViewInverse, Bool doUpdate=true);	///<generate the uv coordinates for Noise1 (i.e clouds)
-	void updateNoise2 (D3DXMATRIX *destMatrix,D3DXMATRIX *curViewInverse, Bool doUpdate=true);	///<generate the uv coordinates for Noise2 (i.e lightmap)
+		void updateNoise2 (D3DXMATRIX *destMatrix,D3DXMATRIX *curViewInverse, Bool doUpdate=true);	///<generate the uv coordinates for Noise2 (i.e lightmap)
 } terrainShader2Stage;
+
+/// D3D11-only terrain normal-mapping shader. Under D3D11 the DX8 .pso pixel
+/// shaders are stubbed, so this routes terrain through the clean HLSL terrain
+/// normal pixel shader (kTerrainNormalPixelShaderHLSL, compiled in D3D11Backend)
+/// while reusing the DX8 mirror layer for texture binding and the projected
+/// lightmap (camera-space texgen, identical to the ST_TERRAIN_BASE_NOISE2 path).
+/// init() is a no-op: registration happens in terrainShader2Stage::init() under
+/// D3D11 (that shader is what actually "wins" the TerrainShaderList slot there).
+class TerrainNormalShaderPixelShader : public W3DShaderInterface
+{
+public:
+	virtual Int set(Int pass);
+	virtual void reset(void);
+	virtual Int init(void) { return FALSE; }
+	virtual Int shutdown(void) { return TRUE; }
+	// Tracks whether the current invocation is the edge/blend crossfade variant
+	// (ST_TERRAIN_NORMAL_EDGE) so set() can bind the blend pixel shader.
+	static bool s_isEdge;
+} terrainNormalShaderPixelShader;
+bool TerrainNormalShaderPixelShader::s_isEdge = false;
 
 ///regular terrain shader that should work on all multi-texture video cards (slowest version)
 class FlatTerrainShader2Stage : public W3DShaderInterface
@@ -1754,6 +1775,17 @@ Int TerrainShader2Stage::init()
 	W3DShadersPassCount[W3DShaderManager::ST_TERRAIN_BASE_NOISE2]=3;
 	W3DShaders[W3DShaderManager::ST_TERRAIN_BASE_NOISE12]=&terrainShader2Stage;
 	W3DShadersPassCount[W3DShaderManager::ST_TERRAIN_BASE_NOISE12]=3;
+
+	// W3DNext D3D11 terrain normal-mapping: route the NORMAL enums through the
+	// HLSL terrain normal pixel shader. The DX8 .pso path is stubbed under D3D11,
+	// so this is the only working normal path there; on the DX8 backend HeightMap
+	// never selects these enums, so the registration is D3D11-only.
+	if (Is_D3D11_Backend_Active()) {
+		W3DShaders[W3DShaderManager::ST_TERRAIN_NORMAL]=&terrainNormalShaderPixelShader;
+		W3DShadersPassCount[W3DShaderManager::ST_TERRAIN_NORMAL]=1;
+		W3DShaders[W3DShaderManager::ST_TERRAIN_NORMAL_EDGE]=&terrainNormalShaderPixelShader;
+		W3DShadersPassCount[W3DShaderManager::ST_TERRAIN_NORMAL_EDGE]=1;
+	}
 
 	return TRUE;
 }
@@ -2334,6 +2366,347 @@ void TerrainShaderPixelShader::reset()
 	DX8Wrapper::Set_DX8_Texture_Stage_State( 3, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
 	DX8Wrapper::Set_DX8_Texture_Stage_State( 3, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_PASSTHRU|3);
 
+
+	g_renderBackend->Invalidate_Cached_Render_States();
+}
+
+// W3DNext: global flag read by the unit/building normal shader.
+// When true, the normal map pipeline is disabled so civilian NIGHT window
+// textures (which are self-lit RGBA, not normal-mapped) are not crushed.
+extern bool g_w3dnextNightDisableNormal;
+
+// ---- W3DNext day/night cycle -----------------------------------------------
+// Clock state. Elapsed time accumulates only while unpaused, so F7 freezes the
+// sky exactly where it is for inspecting a specific time of day.
+static bool s_dncPaused = false;
+static bool s_dncInit = false;
+static unsigned int s_dncLastFrame = 0;
+static unsigned int s_dncFrozenFrames = 0;
+static unsigned int s_dncEffectiveFrame = 0;
+static Real s_dncHour = 8.0f;
+
+void W3DNextDayCycleTick(void)
+{
+	// W3DNext: F4 no longer pauses the day/night cycle. Pausing silently froze
+	// time at day so night (and the lit-window civilian textures) never arrived.
+}
+
+void W3DNextDayCycleSetFrame(unsigned int gameFrame)
+{
+	if (!s_dncInit) {
+		s_dncInit = true;
+		s_dncLastFrame = gameFrame;
+	}
+	// Clamp so loading spikes / replay scrubbing don't jump the sky forward.
+	unsigned int delta = gameFrame - s_dncLastFrame;
+	if (delta > 10u) delta = 10u;
+	s_dncLastFrame = gameFrame;
+	if (s_dncPaused) {
+		// Keep the local view frozen while paused; on resume it continues
+		// smoothly from where it stopped (other players unaffected).
+		s_dncFrozenFrames += delta;
+	}
+	s_dncEffectiveFrame = gameFrame - s_dncFrozenFrames;
+
+	// W3DNext: update the night-disable flag from the discrete time-of-day
+	// bucket so the unit/building normal shader is disabled at night. This is
+	// driven from SetFrame (called every draw) rather than GetPhase, so it
+	// fires regardless of lighting-phase interpolation state.
+	const int todBucket = W3DNextDayCycleGetTimeOfDayBucket();
+	g_w3dnextNightDisableNormal = (todBucket == TIME_OF_DAY_NIGHT);
+}
+
+bool W3DNextDayCycleGetPhase(Int &anchorA, Int &anchorB, Real &t)
+{
+	const char * e = W3DNext_GetEnv("W3DNEXT_DAYCYCLE");
+	if (e != nullptr && e[0] == '0') {
+		return false;
+	}
+	unsigned int cycleMinutes = 4;   // short loop so night arrives quickly;
+	                                 // override with W3DNEXT_DAYCYCLE_MINUTES=n
+	const char * m = W3DNext_GetEnv("W3DNEXT_DAYCYCLE_MINUTES");
+	if (m != nullptr && m[0] != '\0') {
+		const int v = atoi(m);
+		if (v >= 1 && v <= 1440) cycleMinutes = (unsigned int)v;
+	}
+	// Game logic runs at a fixed 30 fps in lockstep, so frame count is the
+	// multiplayer-safe clock (every peer simulates identical frame numbers).
+	const double cycleFrames = static_cast<double>(cycleMinutes) * 60.0 * 30.0;
+	// Map the cycle onto a 24h clock, starting at 15:00 - the peak of the
+	// Afternoon preset - so every match opens fully bright and lively.
+	Real hour = static_cast<Real>(fmod(static_cast<double>(s_dncEffectiveFrame) / cycleFrames * 24.0 + 15.0, 24.0));
+	s_dncHour = hour;   // cached for the time-of-day bucket getter
+	// Circular preset anchors: Night centred at 03, Morning 09, Afternoon 15,
+	// Evening 21. Find the surrounding pair and blend with smoothstep so each
+	// phase holds near its centre and transitions smoothly between them.
+	Int seg;
+	Real spanT;
+	if (hour < 9.0f && hour >= 3.0f) {           // dawn: Night -> Morning
+		seg = 0; spanT = (hour - 3.0f) / 6.0f;
+	} else if (hour < 15.0f && hour >= 9.0f) {   // day: Morning -> Afternoon
+		seg = 1; spanT = (hour - 9.0f) / 6.0f;
+	} else if (hour < 21.0f && hour >= 15.0f) {  // dusk: Afternoon -> Evening
+		seg = 2; spanT = (hour - 15.0f) / 6.0f;
+	} else {                                     // nightfall: Evening -> Night
+		seg = 3;
+		spanT = ((hour >= 21.0f ? hour : hour + 24.0f) - 21.0f) / 6.0f;
+	}
+	if (spanT < 0.0f) spanT = 0.0f;
+	if (spanT > 1.0f) spanT = 1.0f;
+	t = spanT * spanT * (3.0f - 2.0f * spanT);   // smoothstep
+	static const Int segPreset[4][2] = {
+		{ TIME_OF_DAY_NIGHT,     TIME_OF_DAY_MORNING   },
+		{ TIME_OF_DAY_MORNING,   TIME_OF_DAY_AFTERNOON },
+		{ TIME_OF_DAY_AFTERNOON, TIME_OF_DAY_EVENING   },
+		{ TIME_OF_DAY_EVENING,   TIME_OF_DAY_NIGHT     },
+	};
+	anchorA = segPreset[seg][0];
+	anchorB = segPreset[seg][1];
+	return true;
+}
+
+int W3DNextDayCycleGetTimeOfDayBucket(void)
+{
+	// Derive the discrete TimeOfDay enum bucket (GameType.h values:
+	// MORNING=1, AFTERNOON=2, EVENING=3, NIGHT=4) from the cycle hour so the
+	// visual consumers that key on TheGlobalData->m_timeOfDay - night window
+	// glow on buildings, night model variants, ambient sound sets - follow the
+	// moving sun exactly as they would when a map/script switches time of day.
+	const char * e = W3DNext_GetEnv("W3DNEXT_DAYCYCLE");
+	if (e != nullptr && e[0] == '0') {
+		return -1;
+	}
+	// Thresholds match GetPhase()'s segment anchors exactly (dawn 3-9, day 9-15,
+	// dusk 15-21, nightfall 21-3) so the discrete bucket only flips once the
+	// smooth colour/sun blend for that transition has fully completed (t==1).
+	// Previously this used an independent 6/12/18/21 table, which fired the
+	// flag-flip mid-transition (as early as t==0 on the Evening->Night edge) -
+	// see the comment above the function.
+	if (s_dncHour >= 9.0f && s_dncHour < 15.0f) return TIME_OF_DAY_MORNING;
+	if (s_dncHour >= 15.0f && s_dncHour < 21.0f) return TIME_OF_DAY_AFTERNOON;
+	if (s_dncHour >= 3.0f && s_dncHour < 9.0f) return TIME_OF_DAY_NIGHT;
+	// Remaining range is [21,24) union [0,3): the nightfall transition is still
+	// in progress, so hold at Evening until it completes at hour 3.
+	return TIME_OF_DAY_EVENING;
+}
+
+Int TerrainNormalShaderPixelShader::set(Int pass)
+{
+	//force WW3D2 system to set it's states so it won't later overwrite our custom settings.
+	g_renderBackend->Apply_Render_State_Changes();
+
+	// Base colour = stage0, normal map = stage1 (tile uv), lightmap = stage2 (projected).
+	Bind_Custom_Shader_Texture(0, W3DShaderManager::getShaderTexture(0));
+	Bind_Custom_Shader_Texture(1, W3DShaderManager::getShaderTexture(1));
+
+	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ADDRESSU, D3DTADDRESS_CLAMP);
+	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ADDRESSV, D3DTADDRESS_CLAMP);
+	DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ADDRESSU, D3DTADDRESS_CLAMP);
+	DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ADDRESSV, D3DTADDRESS_CLAMP);
+
+	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_TEXCOORDINDEX, 0);
+	DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_TEXCOORDINDEX, 0);
+
+	if (TheGlobalData && (TheGlobalData->m_bilinearTerrainTex || TheGlobalData->m_trilinearTerrainTex)) {
+		DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MINFILTER, D3DTEXF_LINEAR);
+		DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
+	} else {
+		DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MINFILTER, D3DTEXF_POINT);
+		DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MAGFILTER, D3DTEXF_POINT);
+	}
+	// Normal map (stage 1) always uses bilinear filtering with linear mipmaps to
+	// smooth the seams between adjacent terrain tiles.
+	DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MINFILTER, D3DTEXF_LINEAR);
+	DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
+	if (TheGlobalData && TheGlobalData->m_trilinearTerrainTex) {
+		DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MIPFILTER, D3DTEXF_LINEAR);
+		DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MIPFILTER, D3DTEXF_LINEAR);
+	} else {
+		DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MIPFILTER, D3DTEXF_POINT);
+		DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MIPFILTER, D3DTEXF_LINEAR);
+	}
+
+	// Lightmap on stage2, projected from camera space (same projection the
+	// ST_TERRAIN_BASE_NOISE2 path uses; the lightmap is carried on shader slot 3).
+	D3DXMATRIX curView;
+	DX8Wrapper::_Get_DX8_Transform(D3DTS_VIEW, curView);
+	D3DXMATRIX inv;
+	float det;
+	D3DXMatrixInverse(&inv, &det, &curView);
+	DX8Wrapper::Set_DX8_Texture_Stage_State(2,  D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_CAMERASPACEPOSITION);
+	DX8Wrapper::Set_DX8_Texture_Stage_State(2,  D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2);
+	DX8Wrapper::Set_DX8_Texture_Stage_State(2,  D3DTSS_ADDRESSU, D3DTADDRESS_WRAP);
+	DX8Wrapper::Set_DX8_Texture_Stage_State(2,  D3DTSS_ADDRESSV, D3DTADDRESS_WRAP);
+	Bind_Custom_Shader_Texture(2, W3DShaderManager::getShaderTexture(3));
+	terrainShader2Stage.updateNoise2(&curView, &inv);
+	DX8Wrapper::_Set_DX8_Transform(D3DTS_TEXTURE2, curView);
+
+	// Light direction + intensity from the time-of-day terrain lighting (mirrors
+	// the source GeneralsModern_PBR terrain normal path, minus the live
+	// LightingDebug overrides which W3DNext does not carry).
+	GlobalData::TerrainLighting dncBlend;
+	const GlobalData::TerrainLighting *light;
+	{
+		Int dncA = 0, dncB = 0;
+		Real dncT = 0.0f;
+		if (W3DNextDayCycleGetPhase(dncA, dncB, dncT)) {
+			const GlobalData::TerrainLighting &la = TheGlobalData->m_terrainLighting[dncA][0];
+			const GlobalData::TerrainLighting &lb = TheGlobalData->m_terrainLighting[dncB][0];
+			dncBlend = la;
+			dncBlend.ambient.red   += (lb.ambient.red   - la.ambient.red)   * dncT;
+			dncBlend.ambient.green += (lb.ambient.green - la.ambient.green) * dncT;
+			dncBlend.ambient.blue  += (lb.ambient.blue  - la.ambient.blue)  * dncT;
+			dncBlend.diffuse.red   += (lb.diffuse.red   - la.diffuse.red)   * dncT;
+			dncBlend.diffuse.green += (lb.diffuse.green - la.diffuse.green) * dncT;
+			dncBlend.diffuse.blue  += (lb.diffuse.blue  - la.diffuse.blue)  * dncT;
+			dncBlend.lightPos.x += (lb.lightPos.x - la.lightPos.x) * dncT;
+			dncBlend.lightPos.y += (lb.lightPos.y - la.lightPos.y) * dncT;
+			dncBlend.lightPos.z += (lb.lightPos.z - la.lightPos.z) * dncT;
+			light = &dncBlend;
+		} else {
+			light = &TheGlobalData->m_terrainLighting[TheGlobalData->m_timeOfDay][0];
+		}
+	}
+
+	Vector3 lightRay(-light->lightPos.x, -light->lightPos.y, -light->lightPos.z);
+	lightRay.Normalize();
+
+	// NOTE: previously an extra `lightStrength` (average of diffuse.rgb, clamped
+	// to [0.20,1.0]) was multiplied into sunColor here. The terrain pixel shader
+	// ALSO averaged SunColor into a scalar internally, so the two averages
+	// compounded (~0.7 effective brightness became ~0.49) - this was the main
+	// cause of the terrain looking darker/duller than the original DX8 look.
+	// The shader now uses full RGB lighting directly, so sunColor is passed
+	// through unscaled here, matching how the same diffuse colour lights units.
+	Vector3 sunColor(light->diffuse.red, light->diffuse.green, light->diffuse.blue);
+	Vector3 ambient(light->ambient.red, light->ambient.green, light->ambient.blue);
+
+	D3D11Backend *backend = static_cast<D3D11Backend *>(g_renderBackend);
+	if (s_isEdge) {
+		backend->Set_Terrain_Normal_Blend_Pixel_Shader(true);
+	} else {
+		backend->Set_Terrain_Normal_Pixel_Shader(true);
+	}
+	// useLightMap was hardcoded true, unconditionally multiplying the terrain
+	// colour by the average brightness of whatever texture happens to be in
+	// the shared "shader texture" slot 2 (gLight/t2 in the pixel shader).
+	// Nothing in this codebase calls setShaderTexture(2) to populate that
+	// slot with an actual terrain lightmap - it's a generic slot shared with
+	// unrelated map-effect systems - so this was multiplying every terrain
+	// pixel by an unverified/likely-wrong texture's brightness, directly
+	// contributing to the "dirty/grungy terrain" look. Disabled until a real
+	// terrain lightmap is deliberately wired into that slot.
+	backend->Set_Terrain_Normal_Constants(lightRay, sunColor, ambient, false);
+
+	// God rays: project the sun onto the screen for the post-process pass.
+	// The sample point must originate at the CAMERA (not the world origin) -
+	// an origin-based point lands behind the RTS camera's downward view and
+	// clips away (w<0). Camera position = translation of the inverse view.
+	{
+		// NOTE: `curView` was overwritten in-place by updateNoise2() above (it
+		// becomes the noise texture matrix), so re-fetch the real camera view.
+		D3DXMATRIX camView;
+		DX8Wrapper::_Get_DX8_Transform(D3DTS_VIEW, camView);
+		D3DXMATRIX proj;
+		DX8Wrapper::_Get_DX8_Transform(D3DTS_PROJECTION, proj);
+		D3DXMATRIX vp = camView * proj;
+		D3DXVECTOR3 camPos(inv._41, inv._42, inv._43);
+		D3DXVECTOR4 p(camPos.x + lightRay.X * 4000.0f,
+					  camPos.y + lightRay.Y * 4000.0f,
+					  camPos.z + lightRay.Z * 4000.0f, 1.0f);
+		D3DXVECTOR4 c;
+		D3DXVec4Transform(&c, &p, &vp);
+		float sx = 0.0f, sy = 0.0f, si = 0.0f;
+		// Sun-height gate at 0.18: below this it is dusk/moonlight - the radial
+		// march would smear the moon sprite into a star artifact, so rays off.
+		if (lightRay.Z > 0.18f) {
+			float hz = (lightRay.Z - 0.12f) / 0.88f;
+			if (hz < 0.0f) hz = 0.0f;
+			if (hz > 1.0f) hz = 1.0f;
+			// Two different projections are blended smoothly instead of hard-
+			// switching on c.w > 0.001: the perspective projection (used when the
+			// sun is in front of the camera) and the screen-edge azimuth fallback
+			// (used when it is behind - c.w<=0 - since the perspective divide
+			// degenerates there). The old hard switch made sx/sy/si JUMP the
+			// instant c.w crossed the threshold, which happens naturally as the
+			// camera yaws (the sun goes from "in front" to "behind" the view) -
+			// seen as a sudden god-ray/reflection halo flashing on and off with
+			// camera rotation. blendW ramps from 0 (fully behind, w<=nearEps) to
+			// 1 (comfortably in front, w>=blendRange) so both sx/sy and si cross
+			// over continuously.
+			float sxPersp = 0.0f, syPersp = 0.0f; bool perspValid = false;
+			if (c.w > 0.0001f) {
+				sxPersp = c.x / c.w * 0.5f + 0.5f;
+				syPersp = 0.5f - c.y / c.w * 0.5f;
+				perspValid = (sxPersp > -0.4f && sxPersp < 1.4f && syPersp > -0.4f && syPersp < 1.4f);
+			}
+			float sxEdge = 0.0f, syEdge = 0.0f; bool edgeValid = false;
+			{
+				D3DXVECTOR3 hDir(lightRay.X, lightRay.Y, 0.0f);
+				D3DXVECTOR3 Lv;
+				D3DXVec3TransformNormal(&Lv, &hDir, &camView);
+				const float len2 = sqrtf(Lv.x * Lv.x + Lv.y * Lv.y);
+				if (len2 > 0.01f) {
+					sxEdge = 0.5f + (Lv.x / len2) * 0.65f;
+					syEdge = 0.5f - (Lv.y / len2) * 0.65f;
+					edgeValid = true;
+				}
+			}
+			const float nearEps = 0.0001f, blendRange = 0.15f;
+			float blendW = (c.w - nearEps) / (blendRange - nearEps);
+			if (blendW < 0.0f) blendW = 0.0f;
+			if (blendW > 1.0f) blendW = 1.0f;
+			if (perspValid && edgeValid) {
+				sx = sxEdge + (sxPersp - sxEdge) * blendW;
+				sy = syEdge + (syPersp - syEdge) * blendW;
+				si = hz;
+			} else if (perspValid) {
+				sx = sxPersp; sy = syPersp; si = hz * blendW;
+			} else if (edgeValid) {
+				sx = sxEdge; sy = syEdge; si = hz * (1.0f - blendW);
+			}
+		}
+		{
+			static int s_dbg = 0;
+			if (s_dbg < 4) {
+				D3DXVECTOR3 LvDbg;
+				D3DXVECTOR3 hDbg(lightRay.X, lightRay.Y, 0.0f);
+				D3DXVec3TransformNormal(&LvDbg, &hDbg, &camView);
+				const float lenDbg = sqrtf(LvDbg.x * LvDbg.x + LvDbg.y * LvDbg.y);
+				const char * lpath = W3DNext_GetEnv("D3D11_LOG");
+				FILE * lf = (lpath != nullptr && lpath[0] != '\0') ? std::fopen(lpath, "a") : nullptr;
+				if (lf != nullptr) {
+					std::fprintf(lf, "[godrays dbg] L=(%.2f,%.2f,%.2f) w=%.1f uv=(%.2f,%.2f) i=%.2f | hView=(%.2f,%.2f,%.2f) len2=%.3f | viewRow0=(%.2f,%.2f,%.2f)\n",
+						lightRay.X, lightRay.Y, lightRay.Z, c.w, sx, sy, si,
+						LvDbg.x, LvDbg.y, LvDbg.z, lenDbg,
+						curView._11, curView._12, curView._13);
+					std::fclose(lf);
+				}
+				++s_dbg;
+			}
+		}
+		backend->Set_Sun_Screen(sx, sy, si);
+	}
+
+	return TRUE;
+}
+
+void TerrainNormalShaderPixelShader::reset()
+{
+	// Restore the FF combiner pixel shader the D3D11 backend normally drives.
+	D3D11Backend *backend = static_cast<D3D11Backend *>(g_renderBackend);
+	if (s_isEdge) {
+		backend->Set_Terrain_Normal_Blend_Pixel_Shader(false);
+	} else {
+		backend->Set_Terrain_Normal_Pixel_Shader(false);
+	}
+
+	Bind_Custom_Shader_Texture(0, nullptr);
+	Bind_Custom_Shader_Texture(1, nullptr);
+	Bind_Custom_Shader_Texture(2, nullptr);
+
+	DX8Wrapper::Set_DX8_Texture_Stage_State( 2, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+	DX8Wrapper::Set_DX8_Texture_Stage_State( 2, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_PASSTHRU|2);
 
 	g_renderBackend->Invalidate_Cached_Render_States();
 }
@@ -2969,6 +3342,15 @@ Int W3DShaderManager::setShader(ShaderTypes shader, Int pass)
 		return TRUE;	//shader is already set
 	m_currentShader=shader;
 	m_currentShaderPass = pass;
+	TerrainNormalShaderPixelShader::s_isEdge = (shader == ST_TERRAIN_NORMAL_EDGE);
+	// W3DNext: any non-terrain-normal shader must drop the terrain normal pixel
+	// shader so it cannot leak (as a pink/blue colour) into later draws such as
+	// lightning, shadows or particles when m_useLightMap (night maps) is on.
+	if (shader != ST_TERRAIN_NORMAL && shader != ST_TERRAIN_NORMAL_EDGE
+	    && Is_D3D11_Backend_Active())
+	{
+		static_cast<D3D11Backend *>(g_renderBackend)->Set_Terrain_Normal_Pixel_Shader(false);
+	}
 	if (W3DShaders[shader])
 		return W3DShaders[shader]->set(pass);
 	return FALSE;

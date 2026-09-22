@@ -640,7 +640,7 @@ GlobalData::GlobalData()
 	m_framesPerSecondLimit = 0;
 	m_chipSetType = 0;
 	m_headless = FALSE;
-	m_gfxBackendD3D11 = FALSE;	// W3DNext: default render backend is DX8 (unchanged default path)
+	m_gfxBackendD3D11 = TRUE;	// W3DNext: default render backend is D3D11
 	m_w3dNextBWFilterAtFrame = 0;	// W3DNext: BW screen-filter test hook off by default
 	m_windowed = 0;
 	m_borderless = TRUE;	// W3DNext: default fullscreen is borderless (safe on Win11 alt-tab); -exclusive opts into true exclusive fullscreen

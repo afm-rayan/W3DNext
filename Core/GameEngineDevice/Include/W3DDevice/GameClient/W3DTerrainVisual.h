@@ -31,6 +31,7 @@
 
 #include "GameClient/TerrainVisual.h"
 #include "W3DDevice/GameClient/W3DWater.h"
+#include <vector>
 
 // FORWARD REFERENCES /////////////////////////////////////////////////////////////////////////////
 class Matrix3D;
@@ -108,6 +109,7 @@ public:
 	virtual void removeBibHighlighting() override;
 
 	virtual void addProp(const ThingTemplate *tt, const Coord3D *pos, Real angle) override;
+	void rebuildPropsForTimeOfDay(); // W3DNext: re-evaluate night models of props when day/night bucket changes
 
 	virtual void removeTreesAndPropsForConstruction(
 		const Coord3D* pos,
@@ -177,5 +179,10 @@ protected:
 
   AsciiString	m_currentSkyboxTexNames[NumSkyboxTextures];	///<store current texture names applied to skybox.
 	AsciiString m_initialSkyboxTexNames[NumSkyboxTextures];	///<store starting texture/default skybox textures.
+
+private:
+	struct PropRecord { const ThingTemplate *tmpl; Coord3D pos; Real angle; };
+	std::vector<PropRecord> m_propRecords;
+	bool m_rebuildingProps = false;
 
 };

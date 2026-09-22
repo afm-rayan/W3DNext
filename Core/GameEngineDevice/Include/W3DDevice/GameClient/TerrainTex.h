@@ -106,6 +106,46 @@ public:
 		// just use default destructor.
 };
 
+/** ***********************************************************************
+**                             NormalMapTerrainTextureClass
+***************************************************************************/
+class NormalMapTerrainTextureClass : public TextureClass
+{
+// DBG test: bypass per-class W3D mempool to see if the throw originates there.
+//	W3DMPO_CODE(NormalMapTerrainTextureClass)
+protected:
+	virtual void Apply(unsigned int stage);
+
+public:
+	/// Create texture for a height map.
+	NormalMapTerrainTextureClass(int height);
+	/// Create texture for a height map.
+	NormalMapTerrainTextureClass(int height, int width);
+	// just use default destructor.
+public:
+	int update(WorldHeightMap *htMap);
+	void setLOD(Int LOD);
+};
+
+/** ***********************************************************************
+**                             NormalMapEdgeTextureClass
+***************************************************************************/
+class NormalMapEdgeTextureClass : public TextureClass
+{
+// DBG fix: bypass per-class W3D mempool (its operator new threw for this class).
+//	W3DMPO_CODE(NormalMapEdgeTextureClass)
+protected:
+	virtual void Apply(unsigned int stage);
+	int update256(WorldHeightMap *htMap);
+public:
+	/// Create texture for a height map.
+	NormalMapEdgeTextureClass(int height, MipCountType mipLevelCount = MIP_LEVELS_3 );
+	// just use default destructor.
+public:
+	int update(WorldHeightMap *htMap);
+	void setLOD(Int LOD);
+};
+
 class ScorchTextureClass : public TextureClass
 {
 	W3DMPO_CODE(ScorchTextureClass)

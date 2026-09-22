@@ -53,6 +53,10 @@
 #include "cpudetect.h"
 #include "dx8caps.h"
 
+// W3DNext D3D11 port: lets DX8Wrapper::Set_DX8_Render_State forward explicit
+// D3DRS_* changes (e.g. COLORWRITEENABLE) into the active backend.
+#include "Backend/RenderBackend.h"
+
 #include "texture.h"
 #include "dx8vertexbuffer.h"
 #include "dx8indexbuffer.h"
@@ -255,6 +259,10 @@ struct RenderStateStruct
 	TextureBaseClass * Textures[MAX_TEXTURE_STAGES];
 	D3DLIGHT8 Lights[4];
 	bool LightEnable[4];
+	bool UnitNormalEnable;	// set by the unit-normal feature so the sorting flush can
+							// re-apply (per-polygon) the unit-normal pixel shader; the
+							// D3D11 backend's normal-map pipeline is a side-channel that
+							// the capture does not otherwise record.
 	D3DMATRIX world;
 	D3DMATRIX view;
 	unsigned vertex_buffer_types[MAX_VERTEX_STREAMS];
@@ -363,6 +371,8 @@ public:
 
 	static void Get_Render_State(RenderStateStruct& state);
 	static void Set_Render_State(const RenderStateStruct& state);
+	static void Set_Unit_Normal_Enable(bool enable);
+	static bool Get_Unit_Normal_Enable();
 	static void Release_Render_State();
 
 	static void Set_DX8_Material(const D3DMATERIAL8* mat);
@@ -936,6 +946,31 @@ WWINLINE void DX8Wrapper::Set_DX8_Render_State(D3DRENDERSTATETYPE state, unsigne
 #endif
 
 	RenderStates[state]=value;
+	// W3DNext D3D11 port: the D3D11 backend has no per-call SetRenderState, so
+	// explicit D3DRS_* changes are otherwise dropped. Forward the write mask
+	// (used by the water soft-edge dest-alpha pass and the water RTT clears) into
+	// the backend. No-op on the DX8 backend, which drives COLORWRITEENABLE via
+	// the raw device below.
+	if (state == D3DRS_COLORWRITEENABLE && g_renderBackend != nullptr) {
+		g_renderBackend->Set_Color_Write_Enable(value);
+	}
+	// W3DNext: raw blend writes must reach the D3D11 backend too - the soft
+	// water edge blends with D3DBLEND_DESTALPHA/INVDESTALPHA and the water
+	// alpha pass uses raw SRCALPHA/INVSRCALPHA; dropped, the shoreline goes
+	// hard and water renders with a stale blend.
+	else if (g_renderBackend != nullptr) {
+		if (state == D3DRS_ALPHABLENDENABLE) {
+			g_renderBackend->Set_Raw_Blend_Enable(value);
+		} else if (state == D3DRS_SRCBLEND) {
+			g_renderBackend->Set_Raw_Src_Blend(value);
+		} else if (state == D3DRS_DESTBLEND) {
+			g_renderBackend->Set_Raw_Dst_Blend(value);
+		}
+		// Stencil block (52..59): drives the volumetric shadow passes.
+		else if (state >= D3DRS_STENCILENABLE && state <= D3DRS_STENCILWRITEMASK) {
+			g_renderBackend->Set_Raw_Stencil(state, value);
+		}
+	}
 	DX8CALL(SetRenderState( state, value ));
 	DX8_RECORD_RENDER_STATE_CHANGE();
 }
@@ -1012,6 +1047,11 @@ void D3D11_Mirror_Copy_Rects(
 // eviction can only leak, never alias a later texture onto stale pixels. Defined
 // in Backend/D3D11Backend_W3D.cpp; no-op unless the D3D11 backend is active.
 void D3D11_Evict_Cached_Texture(unsigned texture_id);
+// W3DNext renderer port: drops a dying render-target texture's D3D11 resources
+// from the backend (called from ~TextureBaseClass). Mirror of the above; lets a
+// recreated RT (settings change / map reload) get a fresh m_rtt entry. Defined
+// in Backend/D3D11Backend_W3D.cpp; no-op unless the D3D11 backend is active.
+void D3D11_Evict_Render_Target(TextureBaseClass * tex);
 
 WWINLINE void DX8Wrapper::_Copy_DX8_Rects(
   IDirect3DSurface8* pSourceSurface,
@@ -1246,6 +1286,16 @@ WWINLINE void DX8Wrapper::Set_Alpha (const float alpha, unsigned int &color)
 WWINLINE void DX8Wrapper::Get_Render_State(RenderStateStruct& state)
 {
 	state=render_state;
+}
+
+WWINLINE void DX8Wrapper::Set_Unit_Normal_Enable(bool enable)
+{
+	render_state.UnitNormalEnable = enable;
+}
+
+WWINLINE bool DX8Wrapper::Get_Unit_Normal_Enable()
+{
+	return render_state.UnitNormalEnable;
 }
 
 WWINLINE void DX8Wrapper::Get_Shader(ShaderClass& shader)
@@ -1508,6 +1558,7 @@ WWINLINE RenderStateStruct& RenderStateStruct::operator= (const RenderStateStruc
 	shader=src.shader;
 	world=src.world;
 	view=src.view;
+	UnitNormalEnable=src.UnitNormalEnable;
 	for (i=0;i<MAX_VERTEX_STREAMS;++i) {
 		vertex_buffer_types[i]=src.vertex_buffer_types[i];
 	}

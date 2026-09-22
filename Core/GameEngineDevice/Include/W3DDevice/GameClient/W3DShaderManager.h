@@ -59,6 +59,8 @@ public:
 		ST_TERRAIN_BASE_NOISE1,	//shader to apply base texture and cloud/noise 1.
 		ST_TERRAIN_BASE_NOISE2,	//shader to apply base texture and cloud/noise 2.
 		ST_TERRAIN_BASE_NOISE12,//shader to apply base texture and both cloud/noise
+		ST_TERRAIN_NORMAL,		//D3D11 HLSL: base + normal-map bump + projected lightmap
+		ST_TERRAIN_NORMAL_EDGE,	//D3D11 HLSL: blend-cell edge pass (neighbor normal + lightmap)
 		ST_SHROUD_TEXTURE,		//shader to apply shroud texture projection.
 		ST_MASK_TEXTURE,		//shader to apply alpha mask texture projection.
 		ST_ROAD_BASE,	//shader to apply base terrain texture only
@@ -251,3 +253,17 @@ protected:
 	static Bool m_skipRender;
 	static TextureClass *m_fadePatternTexture;	///<shape/pattern of the fade
 };
+
+// W3DNext day/night cycle ----------------------------------------------------
+// Smooth 24h lighting loop over the four map lighting presets (Morning,
+// Afternoon, Evening, Night). The sun direction sweeps the sky as the phase
+// advances so relief shadows rotate and light colour temperature shifts.
+// Default cycle length: 24 real minutes (= 1 minute per game hour). Override
+// with W3DNEXT_DAYCYCLE_MINUTES=n; disable entirely with W3DNEXT_DAYCYCLE=0.
+// F7 pauses/resumes the clock for inspecting a specific time of day.
+bool W3DNextDayCycleGetPhase(Int &anchorA, Int &anchorB, Real &t);
+void W3DNextDayCycleTick(void);          // F4 pauses/resumes (local view only)
+void W3DNextDayCycleSetFrame(unsigned int gameFrame);  // feed the LOCKSTEP game frame so every player sees the same sky
+int W3DNextDayCycleGetTimeOfDayBucket(void);  // current TimeOfDay enum bucket (-1 = cycle disabled)
+void W3DNext_D3D11_ClearUnitNormalForShroud(); // shroud pass helper: drops sticky unit/terrain normal PS
+extern bool g_w3dnextShroudPassActive; // true between Shroud Install/UnInstall — backend checks it

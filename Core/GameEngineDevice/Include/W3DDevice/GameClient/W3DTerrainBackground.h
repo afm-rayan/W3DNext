@@ -90,6 +90,7 @@ public:
 	void updateTexture(); // notify camera moved [3/24/2003]
 	Bool isCulled() {return m_cullStatus==CULL_STATUS_INVISIBLE;}
 	Int getTexMultiplier() {return m_texMultiplier;}
+	AABoxClass &getBounds() {return m_bounds;}
 protected:
 	enum {CULL_STATUS_UNKNOWN, CULL_STATUS_VISIBLE, CULL_STATUS_INVISIBLE} m_cullStatus;
 	AABoxClass						m_bounds;

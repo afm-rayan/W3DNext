@@ -25,10 +25,26 @@
 
 #include "D3D11States.h"
 
+#include <cstdlib>
 #include <d3d11.h>
 
 namespace
 {
+
+// Two-sided stencil (see Get_Depth_State) is opt-in via this env var, default
+// OFF, because enabling it unconditionally caused severe, broad rendering
+// corruption (black terrain, broken water, opaque shadow blobs) through some
+// runtime interaction not visible from static source reading alone. Kept
+// self-contained (no new header dependency) since this file also compiles
+// into the standalone d3d11_smoke test.
+bool W3DNext_TwoSidedStencil_Enabled()
+{
+	static const bool s_enabled = [] {
+		const char * e = std::getenv("W3DNEXT_TWOSIDED_STENCIL");
+		return e != nullptr && e[0] == '1';
+	}();
+	return s_enabled;
+}
 
 // --- RB_* -> D3D11 translation (all D3D ABI values confined to this file) -----
 
@@ -76,6 +92,21 @@ D3D11_BLEND_OP To_D3D11_Blend_Op(RenderBackendBlendOp op)
 	}
 }
 
+D3D11_STENCIL_OP To_D3D11_StencilOp(RenderBackendStencilOp op)
+{
+	switch (op) {
+	case RB_STENCILOP_ZERO:    return D3D11_STENCIL_OP_ZERO;
+	case RB_STENCILOP_REPLACE: return D3D11_STENCIL_OP_REPLACE;
+	case RB_STENCILOP_INCRSAT: return D3D11_STENCIL_OP_INCR_SAT;
+	case RB_STENCILOP_DECRSAT: return D3D11_STENCIL_OP_DECR_SAT;
+	case RB_STENCILOP_INVERT:  return D3D11_STENCIL_OP_INVERT;
+	case RB_STENCILOP_INCR:    return D3D11_STENCIL_OP_INCR;
+	case RB_STENCILOP_DECR:    return D3D11_STENCIL_OP_DECR;
+	case RB_STENCILOP_KEEP:
+	default:                   return D3D11_STENCIL_OP_KEEP;
+	}
+}
+
 D3D11_COMPARISON_FUNC To_D3D11_Cmp(RenderBackendCmpFunc f)
 {
 	switch (f) {
@@ -120,9 +151,23 @@ RenderStateVector::RenderStateVector()
 	, srcBlend(RB_BLEND_ONE)
 	, dstBlend(RB_BLEND_ZERO)
 	, blendOp(RB_BLENDOP_ADD)
+	, colorWriteEnable(0xF) // all channels (R|G|B|A) by default
 	, depthEnable(true)
 	, depthWrite(true)
 	, depthFunc(RB_CMP_LESSEQUAL)
+	, stencilEnable(false)
+	, stencilFunc(RB_CMP_ALWAYS)
+	, stencilFail(RB_STENCILOP_KEEP)
+	, stencilZFail(RB_STENCILOP_KEEP)
+	, stencilPass(RB_STENCILOP_KEEP)
+	, stencilRef(0)
+	, stencilMask(0xFFFFFFFF)
+	, stencilWriteMask(0xFFFFFFFF)
+	, twoSidedStencil(false)
+	, ccwStencilFunc(RB_CMP_ALWAYS)
+	, ccwStencilFail(RB_STENCILOP_KEEP)
+	, ccwStencilZFail(RB_STENCILOP_KEEP)
+	, ccwStencilPass(RB_STENCILOP_KEEP)
 	// Bring-up: cull NONE, matching both the Initialize-time rasterizer and the
 	// Set_Shader translation (which forces CULL_NONE until the DX8-vs-D3D11
 	// winding convention is settled). The DX8 default is CULL_CW; restore that
@@ -135,17 +180,18 @@ RenderStateVector::RenderStateVector()
 
 unsigned int RenderStateVector::Blend_Key() const
 {
-	// blendEnable:1 | srcBlend:4 | dstBlend:4 | blendOp:3 (well under 32 bits).
-	// When blending is OFF the src/dst/op fields are irrelevant to the created
-	// object, so they are masked out - every "blend off" vector collapses onto a
-	// single cached passthrough object regardless of its stale factor fields.
+	// colorWriteEnable:4 is always significant - even with blending OFF the OM
+	// render-target write mask differs, so a "write alpha only" passthrough must
+	// not share a cached ID3D11BlendState with a "write all" passthrough.
+	// Then: blendEnable:1 | srcBlend:4 | dstBlend:4 | blendOp:3.
+	unsigned int k = (static_cast<unsigned int>(colorWriteEnable) & 0xF);
 	if (!blendEnable) {
-		return 0u;
+		return k;
 	}
-	unsigned int k = 1u;
-	k |= (static_cast<unsigned int>(srcBlend) & 0xF) << 1;
-	k |= (static_cast<unsigned int>(dstBlend) & 0xF) << 5;
-	k |= (static_cast<unsigned int>(blendOp)  & 0x7) << 9;
+	k |= 1u << 4;
+	k |= (static_cast<unsigned int>(srcBlend) & 0xF) << 5;
+	k |= (static_cast<unsigned int>(dstBlend) & 0xF) << 9;
+	k |= (static_cast<unsigned int>(blendOp)  & 0x7) << 13;
 	return k;
 }
 
@@ -155,6 +201,22 @@ unsigned int RenderStateVector::Depth_Key() const
 	unsigned int k = depthEnable ? 1u : 0u;
 	k |= (depthWrite ? 1u : 0u) << 1;
 	k |= (static_cast<unsigned int>(depthFunc) & 0x7) << 2;
+	// Stencil states fold into the same key with a strong mix: the reachable
+	// stencil state space is tiny (a handful of shadow-volume configurations),
+	// so FNV-1a over the fields keeps collisions practically impossible while
+	// disabled-stencil vectors keep sharing the single fast-path key.
+	if (!stencilEnable) {
+		return k;
+	}
+	unsigned int s = stencilFunc | (stencilFail << 3) | (stencilZFail << 6)
+		| (stencilPass << 9) | (stencilRef << 12) ^ stencilMask ^ (stencilWriteMask * 0x9E3779B9u);
+	if (twoSidedStencil) {
+		s ^= 1u << 20;
+		s ^= (ccwStencilFunc | (ccwStencilFail << 3) | (ccwStencilZFail << 6) | (ccwStencilPass << 9)) * 0x2E4B8CADu;
+	}
+	s ^= s >> 15; s *= 0x2545F491u; s ^= s >> 13;
+	k |= 1u << 5;
+	k ^= s * 0x85EBCA6Bu + 0x27D4EB2Fu;
 	return k;
 }
 
@@ -193,7 +255,9 @@ ID3D11BlendState * D3D11StateCache::Get_Blend_State(ID3D11Device * device, const
 	rt.SrcBlendAlpha = To_D3D11_Blend_Alpha(rs.srcBlend);
 	rt.DestBlendAlpha = To_D3D11_Blend_Alpha(rs.dstBlend);
 	rt.BlendOpAlpha = To_D3D11_Blend_Op(rs.blendOp);
-	rt.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+	// D3DCOLORWRITEENABLE_R/G/B/A (1/2/4/8) share the bit layout of
+	// D3D11_COLOR_WRITE_ENABLE_R/G/B/A, so the low 4 bits map directly.
+	rt.RenderTargetWriteMask = static_cast<D3D11_COLOR_WRITE_ENABLE>(rs.colorWriteEnable & 0xF);
 
 	ID3D11BlendState * state = nullptr;
 	if (FAILED(device->CreateBlendState(&desc, &state))) {
@@ -219,7 +283,40 @@ ID3D11DepthStencilState * D3D11StateCache::Get_Depth_State(ID3D11Device * device
 	desc.DepthEnable = rs.depthEnable ? TRUE : FALSE;
 	desc.DepthWriteMask = rs.depthWrite ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
 	desc.DepthFunc = To_D3D11_Cmp(rs.depthFunc);
-	desc.StencilEnable = FALSE;
+	desc.StencilEnable = rs.stencilEnable ? TRUE : FALSE;
+	if (rs.stencilEnable) {
+		desc.StencilReadMask = static_cast<UINT8>(rs.stencilMask & 0xFF);
+		desc.StencilWriteMask = static_cast<UINT8>(rs.stencilWriteMask & 0xFF);
+		D3D11_DEPTH_STENCILOP_DESC & fo = desc.FrontFace;
+		fo.StencilFailOp = To_D3D11_StencilOp(rs.stencilFail);
+		fo.StencilDepthFailOp = To_D3D11_StencilOp(rs.stencilZFail);
+		fo.StencilPassOp = To_D3D11_StencilOp(rs.stencilPass);
+		fo.StencilFunc = To_D3D11_Cmp(rs.stencilFunc);
+		if (rs.twoSidedStencil && W3DNext_TwoSidedStencil_Enabled()) {
+			// Real two-sided stencil (D3DRS_TWOSIDEDSTENCILMODE +
+			// D3DRS_CCW_STENCIL*): the shadow-volume passes need genuinely
+			// different front/back ops (e.g. incr on back-face depth-fail,
+			// decr on front-face depth-fail) to count the volume correctly.
+			// Opt-in via env var (see W3DNext_TwoSidedStencil_Enabled) -
+			// enabling this unconditionally caused severe, broad rendering
+			// corruption (black terrain, broken water, opaque shadow blobs)
+			// through some runtime interaction that isn't visible from static
+			// source reading alone (likely needs a GPU frame-capture tool
+			// such as RenderDoc/PIX to pin down). Defaults OFF so behaviour
+			// matches the previously-working mirrored path until that's
+			// properly diagnosed.
+			D3D11_DEPTH_STENCILOP_DESC & bo = desc.BackFace;
+			bo.StencilFailOp = To_D3D11_StencilOp(rs.ccwStencilFail);
+			bo.StencilDepthFailOp = To_D3D11_StencilOp(rs.ccwStencilZFail);
+			bo.StencilPassOp = To_D3D11_StencilOp(rs.ccwStencilPass);
+			bo.StencilFunc = To_D3D11_Cmp(rs.ccwStencilFunc);
+		} else {
+			// DX8 single-sided stenciling: D3D11 still requires both
+			// descriptors filled in, so mirror the front-face ops (this path
+			// is unrelated to shadow volumes and mirroring is correct here).
+			desc.BackFace = fo;
+		}
+	}
 
 	ID3D11DepthStencilState * state = nullptr;
 	if (FAILED(device->CreateDepthStencilState(&desc, &state))) {

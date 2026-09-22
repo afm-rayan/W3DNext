@@ -55,6 +55,9 @@
 #include "rinfo.h"
 #include "statistics.h"
 #include "meshmdl.h"
+#include "assetmgr.h"
+#include "Backend/D3D11Backend.h"
+#include <cstring>
 #include "vp.h"
 #include "decalmsh.h"
 #include "matpass.h"
@@ -197,7 +200,10 @@ DX8TextureCategoryClass::DX8TextureCategoryClass(
 	shader(shd),
 	render_task_head(nullptr),
 	material(mat),
-	container(container_)
+	container(container_),
+	m_unitNormalMap(nullptr),
+	m_unitNormalChecked(false),
+	m_unitCheckedF5(false)
 {
 	WWASSERT(pass>=0);
 	WWASSERT(pass<DX8FVFCategoryContainer::MAX_PASSES);
@@ -223,6 +229,7 @@ DX8TextureCategoryClass::~DX8TextureCategoryClass()
 	}
 
 	REF_PTR_RELEASE(material);
+	REF_PTR_RELEASE(m_unitNormalMap);
 
 	DEBUG_ASSERTCRASH(render_task_head == nullptr, ("~DX8TextureCategoryClass: Leaking render tasks"));
 }
@@ -293,6 +300,14 @@ void DX8FVFCategoryContainer::Add_Visible_Material_Pass(MaterialPassClass * pass
 
 void DX8FVFCategoryContainer::Render_Procedural_Material_Passes()
 {
+	// W3DNext: clear unit-normal shader before additional material passes so
+	// a normal-mapped unit's pipeline cannot leak into the shroud/overlay pass
+	// (buildings turning pink/magenta in fog of war).
+	if (Is_D3D11_Backend_Active()) {
+		static_cast<D3D11Backend *>(g_renderBackend)->Set_Unit_Normal_Pixel_Shader(false);
+		DX8Wrapper::Set_Unit_Normal_Enable(false);
+	}
+
 	// additional passes
 	MatPassTaskClass * mpr = visible_matpass_head;
 	MatPassTaskClass * last_mpr = nullptr;
@@ -1677,8 +1692,304 @@ unsigned DX8TextureCategoryClass::Add_Mesh(
 
 // ----------------------------------------------------------------------------
 
+// W3DNext: set by DX8MeshRendererClass::Render() before the texture categories
+// of each mesh are drawn. True only when the mesh has a live lighting environment
+// (i.e. it is actually lit). Unlit meshes (radar-unrevealed areas, objects in
+// shadow, lightning flashes) bind their normal map to stage 0 as the diffuse, so
+// routing them through the unit-normal path shows rainbow/pink. They fall back to
+// the FF combiner which handles stage 0 correctly.
+static bool s_w3dnextMeshLit = false;
+
+// W3DNext: unit normal mapping runtime toggle. Default ON; the F9 key (handled
+// in D3D11Backend::End_Frame) calls W3DNext_Toggle_UnitNormalEnabled() to flip
+// it live so the relief difference can be A/B compared in-game.
+bool g_w3dnextUnitNormalEnabled = true;
+void W3DNext_Toggle_UnitNormalEnabled() { g_w3dnextUnitNormalEnabled = !g_w3dnextUnitNormalEnabled; }
+
+// W3DNext: building normal mapping is OFF by default (buildings have flat
+// auto-generated _nrm maps → no relief, just shadow/pink). F5 toggles it.
+bool g_w3dnextBuildingNormalEnabled = false;
+void W3DNext_Toggle_BuildingNormalEnabled() { g_w3dnextBuildingNormalEnabled = !g_w3dnextBuildingNormalEnabled; }
+
+// W3DNext: at night the unit/building normal-mapping pixel shader crushes the
+// diffuse (its ambient comes from m_lighting.globalAmbient, which the night
+// ambient boost does not feed), so civilian buildings' lit-window textures go
+// black. Disable the normal shader while night is in the time-of-day blend so
+// buildings fall back to the standard FF path (which shows the lit windows).
+bool g_w3dnextNightDisableNormal = false;
+
+// W3DNext: per-mesh unit-normal apply/reset. Called from the draw loop for every
+// mesh so the global unit-normal pixel shader + UnitNormalEnable flag are correct
+// for THIS mesh and never leak into the next (rocks/buildings turning pink).
+void DX8TextureCategoryClass::W3DNext_UnitNormal_PerMesh(ShaderClass sh, bool isWorldDiffuse, bool terrainNormalActive)
+{
+	if (!Is_D3D11_Backend_Active())
+		return;
+
+	TextureClass * origT1 = Peek_Texture(1);
+	D3D11Backend * backend = static_cast<D3D11Backend *>(g_renderBackend);
+
+	// Default: OFF. Only meshes that own a "_nrm" sibling get the normal shader.
+	bool active = false;
+	if (g_w3dnextUnitNormalEnabled && isWorldDiffuse && g_w3dnextDiagMode != 3 && g_w3dnextDiagMode != 4 && s_w3dnextMeshLit && !terrainNormalActive) {
+		// Probe ONCE per texture category (the F5 toggle invalidates the cached
+		// decision so buildings can be toggled live). The probe is EXPENSIVE -
+		// string building, ~40 keyword strstr calls and a texture-manager lookup -
+		// and running it per-mesh-per-frame was the severe frame rate drop noted
+		// in the original design comments. The cached decision is reused here on
+		// the cheap path: active == "this category has a bound _nrm map".
+		bool f5 = g_w3dnextBuildingNormalEnabled;
+		if (!m_unitNormalChecked || m_unitCheckedF5 != f5) {
+			m_unitNormalChecked = true;
+			m_unitCheckedF5 = f5;
+			m_unitNormalMap = nullptr;
+			TextureClass * base = Peek_Texture(0);
+			if (base != nullptr) {
+				const char * bname = base->Get_Texture_Name();
+				if (bname[0] == '#') {
+					const char * second = std::strchr(bname + 1, '#');
+					if (second != nullptr) { bname = second + 1; }
+				}
+				char lcname[256];
+				{
+					size_t n = 0;
+					for (const char * p = bname; *p && n + 1 < sizeof(lcname); ++p, ++n) {
+						char c = *p;
+						if (c >= 'A' && c <= 'Z') { c = char(c - 'A' + 'a'); }
+					lcname[n] = c;
+				}
+				lcname[n] = '\0';
+			}
+			// Skip UI / non-world layers by name.
+			bool looksNonWorld = (std::strstr(lcname, "shell") != nullptr) ||
+			                     (std::strstr(lcname, "scsm") != nullptr) ||
+			                     (std::strstr(lcname, "icon") != nullptr) ||
+			                     (std::strstr(lcname, "mouse") != nullptr) ||
+			                     (std::strstr(lcname, "cursor") != nullptr) ||
+			                     (std::strstr(lcname, "button") != nullptr) ||
+			                     (std::strstr(lcname, "housecolor") != nullptr) ||
+			                     (std::strstr(lcname, "uirtun") != nullptr) ||
+			                     (std::strstr(lcname, "uir") != nullptr) ||      // radar/UI layers (uirguard, uiter, ...)
+			                     (std::strstr(lcname, "zhca_") != nullptr) ||    // mod UI asset prefix
+			                     (std::strstr(lcname, "glow") != nullptr) ||
+			                     (std::strstr(lcname, "light") != nullptr) ||
+			                     (std::strstr(lcname, "flash") != nullptr) ||
+			                     (std::strstr(lcname, "emblem") != nullptr) ||
+			                     (std::strstr(lcname, "decal") != nullptr);
+			// The mod's normal-map generator created a "_n" sibling for EVERY texture,
+			// including pure effects (fire, smoke, clouds, lightning, lasers, explosions,
+			// satellite/radar scans, halos, moon, glows). Sampling those "_n" files as a
+			// normal map tints the effect pink/blue. So we must refuse the unit-normal path
+			// for any effect texture. Generals prefixes effects with "ex" and cinematics with
+			// "cine"; everything else is caught by the keyword list below.
+			bool looksLikeEffect = (lcname[0] == 'e' && lcname[1] == 'x') ||   // exlightning, exfireball, excloud, exsmoke, exlaser, exshell, ...
+			                       (std::strncmp(lcname, "cine", 4) == 0) ||  // cine_moon, cine_satphoto, cine_sattelite, cine_clouds
+			                       (std::strstr(lcname, "glow") != nullptr) ||
+			                       (std::strstr(lcname, "halo") != nullptr) ||
+			                       (std::strstr(lcname, "sun") != nullptr) ||
+			                       (std::strstr(lcname, "moon") != nullptr) ||
+			                       (std::strstr(lcname, "flare") != nullptr) ||
+			                       (std::strstr(lcname, "beam") != nullptr) ||
+			                       (std::strstr(lcname, "satellite") != nullptr) ||
+			                       (std::strstr(lcname, "sattelite") != nullptr) ||
+			                       (std::strstr(lcname, "satphoto") != nullptr) ||
+			                       (std::strstr(lcname, "satellit") != nullptr) ||
+			                       (std::strstr(lcname, "radar") != nullptr) ||
+			                       (std::strstr(lcname, "flash") != nullptr) ||
+			                       (std::strstr(lcname, "laser") != nullptr) ||
+			                       (std::strstr(lcname, "spark") != nullptr) ||
+			                       (std::strstr(lcname, "explosion") != nullptr) ||
+			                       (std::strstr(lcname, "noise") != nullptr) ||
+			                       (std::strstr(lcname, "ring") != nullptr) ||
+			                       (std::strstr(lcname, "shell") != nullptr) ||
+			                       (std::strstr(lcname, "emp") != nullptr) ||
+			                       (std::strstr(lcname, "countermeasure") != nullptr) ||
+			                       (std::strstr(lcname, "missile") != nullptr) ||
+			                       (std::strstr(lcname, "missle") != nullptr) ||
+			                       (std::strstr(lcname, "avalanche") != nullptr) ||
+			                       (std::strstr(lcname, "cop") != nullptr) ||
+			                       (std::strstr(lcname, "dropspot") != nullptr) ||
+			                       (std::strstr(lcname, "smokestack") != nullptr) ||
+			                       (std::strstr(lcname, "coreglow") != nullptr) ||
+			                       (std::strstr(lcname, "pwrglow") != nullptr) ||
+			                       (std::strstr(lcname, "shroud") != nullptr) ||
+			                       (std::strstr(lcname, "fog") != nullptr) ||
+			                       (std::strstr(lcname, "mist") != nullptr) ||
+			                       (std::strstr(lcname, "vapor") != nullptr) ||
+			                       (std::strstr(lcname, "steam") != nullptr) ||
+			                       (std::strstr(lcname, "splash") != nullptr) ||
+			                       (std::strstr(lcname, "spotlight") != nullptr) ||
+			                       (std::strstr(lcname, "pointlight") != nullptr) ||
+			                       (std::strstr(lcname, "ambient") != nullptr) ||
+			                       (std::strstr(lcname, "weather") != nullptr) ||
+			                       (std::strstr(lcname, "cloud") != nullptr) ||
+			                       (std::strstr(lcname, "smoke") != nullptr) ||
+			                       (std::strstr(lcname, "reveal") != nullptr) ||
+			                       (std::strstr(lcname, "scanner") != nullptr) ||
+			                       (std::strstr(lcname, "scan") != nullptr) ||
+			                       (std::strstr(lcname, "radius") != nullptr) ||
+			                       (std::strstr(lcname, "selection") != nullptr);
+			bool looksLikeWater = (std::strstr(lcname, "lake") != nullptr) ||
+			                      (std::strstr(lcname, "water") != nullptr) ||
+			                      (std::strstr(lcname, "river") != nullptr) ||
+			                      (std::strstr(lcname, "sea") != nullptr) ||
+			                      (std::strstr(lcname, "ocean") != nullptr) ||
+			                      (std::strstr(lcname, "wave") != nullptr) ||
+			                      (std::strstr(lcname, "shore") != nullptr) ||
+			                      (std::strstr(lcname, "ripple") != nullptr) ||
+			                      (std::strstr(lcname, "caustic") != nullptr) ||
+			                      (std::strstr(lcname, "wet") != nullptr);
+			// Vegetation alpha-cards: relief on billboard foliage just shimmers.
+			bool looksLikeVegetation = (std::strstr(lcname, "palm") != nullptr) ||
+			                           (std::strstr(lcname, "tree") != nullptr) ||
+			                           (std::strstr(lcname, "pine") != nullptr) ||
+			                           (std::strstr(lcname, "oak") != nullptr) ||
+			                           (std::strstr(lcname, "bush") != nullptr) ||
+			                           (std::strstr(lcname, "shrub") != nullptr) ||
+			                           (std::strstr(lcname, "leaf") != nullptr) ||
+			                           (std::strstr(lcname, "jungle") != nullptr);
+			// Buildings/structures: flat auto _nrm maps → no relief, just shadow/pink.
+			// Keep unit relief only for units/vehicles; buildings stay flat unless F5 enables.
+			bool looksLikeBuilding = false;
+			if (lcname[0] && lcname[1] && lcname[1] == 'b') looksLikeBuilding = true;
+			else if (std::strstr(lcname, "house") || std::strstr(lcname, "barrack") || std::strstr(lcname, "factory") || std::strstr(lcname, "plant") || std::strstr(lcname, "command") || std::strstr(lcname, "center") || std::strstr(lcname, "centr") || std::strstr(lcname, "power") || std::strstr(lcname, "tower") || std::strstr(lcname, "bunker") || std::strstr(lcname, "wall") || std::strstr(lcname, "fence") || std::strstr(lcname, "slab") || std::strstr(lcname, "crate") || std::strstr(lcname, "airfield") || std::strstr(lcname, "warfact") || std::strstr(lcname, "supply") || std::strstr(lcname, "refinery") || std::strstr(lcname, "outpost") || std::strstr(lcname, "well") || std::strstr(lcname, "hq") || std::strstr(lcname, "garrison")) looksLikeBuilding = true;
+			if (looksLikeBuilding && !g_w3dnextBuildingNormalEnabled) {
+				// skip: leave active=false, buildings render flat via FF combiner
+			} else if (!looksNonWorld && !looksLikeWater && !looksLikeEffect && !looksLikeVegetation) {
+				// W3DNext: relief is now derived procedurally from the base diffuse
+				// inside the shader (no _nrm companion needed), so activation no longer
+				// depends on a normal-map file existing. Hulls that only ship a .dds
+				// day texture (most units) therefore get real relief too. We still try
+				// to bind a "_nrm" sibling if present (harmless - currently unused),
+				// but it no longer gates activation.
+				active = true;
+				StringClass nname;
+				const char * dot = std::strrchr(bname, '.');
+				if (dot != nullptr) {
+					nname = StringClass(bname, int(dot - bname));
+					nname += "_nrm";
+					nname += dot;
+				} else {
+					nname = bname;
+					nname += "_nrm";
+				}
+				TextureClass * nrm = WW3DAssetManager::Get_Instance()->Get_Texture(nname);
+				// Guard against a fallback/placeholder texture: most units do NOT ship a
+				// real "..._nrm.dds" file, and asset managers in this engine family
+				// commonly return a shared "missing texture" stand-in (not nullptr) so
+				// callers elsewhere in the codebase that skip the null check do not
+				// crash. If we trusted any non-null result here, every unit WITHOUT a
+				// real normal map would bind that placeholder as if it were a valid
+				// tangent-space normal map and light() would decode nonsense from it -
+				// this is what "normal map not applying correctly on units/buildings"
+				// actually was. Only trust the result when its own texture name matches
+				// the exact file we asked for - a placeholder keeps its own name.
+				if (nrm != nullptr) {
+					const char * gotName = nrm->Get_Texture_Name();
+					if (gotName != nullptr && std::strcmp(gotName, nname) == 0) {
+						// Bind the companion _nrm. Do NOT require Is_Initialized() here: the
+						// texture uploads lazily the first time it is drawn, so at probe time
+						// it is still "uninitialized" and we would otherwise fall back to the
+						// team-color layer (a constant) -> a flat normal -> no relief. Holding
+						// the ref keeps it alive for the active branch's Set_Texture(1, ...).
+						m_unitNormalMap = nrm;
+					} else {
+						m_unitNormalMap = nullptr;
+					}
+				} else {
+					m_unitNormalMap = nullptr;
+				}
+			}
+			}
+		}
+		// Cheap per-mesh path: reuse the cached probe decision (see comment above).
+		// W3DNext: suppress at night so lit-window textures are not crushed (see
+		// g_w3dnextNightDisableNormal, driven by the day/night cycle in W3DDisplay).
+		active = (m_unitNormalMap != nullptr) && !g_w3dnextNightDisableNormal;
+		{
+			static int s_supLog = 0;
+			if (s_supLog < 60) {
+				const char * bn = "(?)";
+				TextureClass * b0 = Peek_Texture(0);
+				if (b0) bn = (const char *)b0->Get_Texture_Name();
+				FILE *fl = std::fopen("C:\\Users\\AFMRAYAN\\AppData\\Local\\Temp\\opencode\\unitnorm_toggle.log", "a");
+				if (fl) { std::fprintf(fl, "[D3D11] PerMesh norm name=%s nightDisable=%d active=%d hasNormal=%d\n", bn, (int)g_w3dnextNightDisableNormal, (int)active, (int)(m_unitNormalMap!=nullptr)); std::fclose(fl); }
+				s_supLog++;
+			}
+		}
+	}
+
+	// W3DNext root-cause diag: with W3DNEXT_UNORM_DBG=1, log every mesh's gating
+	// decision (capped) so we can see why tanks/units never get the normal shader.
+	{
+		static bool s_dbgOn = (W3DNext_GetEnv("W3DNEXT_UNORM_DBG") != nullptr);
+		static int s_dbgCount = 0;
+		if (s_dbgOn && s_dbgCount < 6000) {
+			const char * dbn = "(?)";
+			TextureClass * db0 = Peek_Texture(0);
+			if (db0) dbn = (const char *)db0->Get_Texture_Name();
+			const char * nmn = "(null)";
+			if (m_unitNormalMap) nmn = (const char *)m_unitNormalMap->Get_Texture_Name();
+			bool gateOuter = g_w3dnextUnitNormalEnabled && isWorldDiffuse &&
+				(g_w3dnextDiagMode != 3) && (g_w3dnextDiagMode != 4) &&
+				s_w3dnextMeshLit && !terrainNormalActive;
+			FILE * dfl = fopen("C:\\Users\\AFMRAYAN\\AppData\\Local\\Temp\\opencode\\unitnorm_dbg.log", "a");
+			if (dfl) {
+				fprintf(dfl, "bn=%s norm=%s gateOuter=%d(u=%d,wd=%d,lit=%d,tn=%d) active=%d\n",
+					dbn, nmn, gateOuter ? 1 : 0,
+					g_w3dnextUnitNormalEnabled ? 1 : 0,
+					isWorldDiffuse ? 1 : 0,
+					s_w3dnextMeshLit ? 1 : 0,
+					terrainNormalActive ? 1 : 0,
+					active ? 1 : 0);
+				fclose(dfl);
+				++s_dbgCount;
+			}
+		}
+	}
+
+		if (active && m_unitNormalMap != nullptr) {
+		bool surfOK = (m_unitNormalMap->Peek_D3D_Base_Texture() != nullptr);
+		REF_PTR_SET(textures[1], m_unitNormalMap);
+		g_renderBackend->Set_Texture(1, m_unitNormalMap);
+		backend->Set_Unit_Normal_Pixel_Shader(true, 0.0f, 0.0f);
+		g_renderBackend->Set_Shader(sh);
+		DX8Wrapper::Set_Unit_Normal_Enable(true);
+		// W3DNext diag: log which base textures get the unit-normal shader so we can
+		// confirm the curated _n files are actually found and bound (bug 3).
+		{
+			static int s_unLog = 0;
+			if (s_unLog < 400) {
+				const char * bn = "(?)";
+				TextureClass * b0 = Peek_Texture(0);
+				if (b0) bn = (const char *)b0->Get_Texture_Name();
+				FILE * fl = fopen("C:\\Users\\AFMRAYAN\\AppData\\Local\\Temp\\opencode\\unitnorm_active.log", "a");
+				if (fl) { fprintf(fl, "ACTIVE base=%s surfOK=%d\n", bn, surfOK ? 1 : 0); fclose(fl); }
+				s_unLog++;
+			}
+		}
+	} else {
+		REF_PTR_SET(textures[1], origT1);
+		g_renderBackend->Set_Texture(1, origT1);
+		backend->Set_Unit_Normal_Pixel_Shader(false);
+		backend->Set_Terrain_Normal_Pixel_Shader(false);
+		g_renderBackend->Set_Shader(sh);
+		DX8Wrapper::Set_Unit_Normal_Enable(false);
+	}
+}
+
 void DX8TextureCategoryClass::Render()
 {
+	// W3DNext: make sure the unit-normal flag is cleared at the start of every
+	// category so a previous unit's "true" can never leak into unrelated draws
+	// (water/terrain/particles render through their own paths and would otherwise
+	// inherit the stale flag and get the unit-normal pixel shader -> white halo).
+	DX8Wrapper::Set_Unit_Normal_Enable(false);
+	// RAII guard: also resets on ANY early return from this function (not just the
+	// normal end), so a category that bails out early can't leave the flag stuck.
+	struct W3DNextUnitNormalReset {
+		~W3DNextUnitNormalReset() { DX8Wrapper::Set_Unit_Normal_Enable(false); }
+	} s_w3dnextUnitNormalReset;
 	#ifdef WWDEBUG
 	if (!WW3D::Expose_Prelit()) {
 	#endif
@@ -1723,6 +2034,42 @@ void DX8TextureCategoryClass::Render()
 
 
 	bool renderTasksRemaining=false;
+
+	// --- D3D11 unit/model normal mapping (lazy companion "_n.tga") ------------
+	// Only the primary diffuse pass of a real 3D world object (unit/building/prop)
+	// is eligible. We detect that with the material's shader settings: a world
+	// diffuse uses a primary gradient (GRADIENT_MODULATE), writes depth, and is
+	// textured. 2D UI / screen passes are deliberately LEFT ALONE. We also skip
+	// known non-diffuse layers by name: team-color ("housecolor"), glows/lights,
+	// emblems and decals - those are separate passes that must keep rendering
+	// through the FF combiner. This avoids the previous breakage where the shader
+	// was applied to menus, glows and team-color layers. The actual switch is
+	// de-duplicated per frame (transition guarded).
+	ShaderClass sh = Get_Shader();
+	bool primaryGrad = (sh.Get_Primary_Gradient() != ShaderClass::GRADIENT_DISABLE);
+	bool depthWrite  = (sh.Get_Depth_Mask() == ShaderClass::DEPTH_WRITE_ENABLE);
+	bool texturing   = (sh.Get_Texturing() == ShaderClass::TEXTURING_ENABLE);
+	bool isScreen    = (sh.Get_SS_Category() == ShaderClass::SSCAT_SCREEN);
+	bool isOverlay   = (!primaryGrad && sh.Get_Secondary_Gradient() != ShaderClass::SECONDARY_GRADIENT_DISABLE);
+	bool isWorldDiffuse = primaryGrad && depthWrite && texturing && !isScreen && !isOverlay;
+
+	if (Is_D3D11_Backend_Active()) {
+		// Cache the normal map across frames (only re-probe if we don't already
+		// have it). The texture manager caches the TextureClass anyway, but the
+		// Get_Texture call itself + name string building is per-mesh-per-frame
+		// overhead that caused the severe frame rate drop. m_unitNormalChecked
+		// gates the lookup so we only probe ONCE per category lifetime.
+		if (!m_unitNormalChecked) {
+			// First time for this category: probe will happen in the per-mesh
+			// helper. Keep m_unitNormalMap across frames after that.
+		}
+		// Default OFF before the mesh loop; W3DNext_UnitNormal_PerMesh re-enables
+		// it per mesh that owns a "_n" sibling.
+		D3D11Backend * backend = static_cast<D3D11Backend *>(g_renderBackend);
+		backend->Set_Unit_Normal_Pixel_Shader(false);
+		backend->Set_Terrain_Normal_Pixel_Shader(false);
+		DX8Wrapper::Set_Unit_Normal_Enable(false);
+	}
 
 	PolyRenderTaskClass * prt = render_task_head;
 	PolyRenderTaskClass * last_prt = nullptr;
@@ -1807,6 +2154,33 @@ void DX8TextureCategoryClass::Render()
 		}
 		else {
 			SNAPSHOT_SAY(("No light environment"));
+		}
+		// W3DNext: record whether this mesh is actually lit so the texture-category
+		// hook can skip the unit-normal path for unlit meshes (which would otherwise
+		// render their normal map as a rainbow diffuse).
+		s_w3dnextMeshLit = (lenv != nullptr && lenv->Get_Light_Count() > 0);
+
+		// W3DNext: apply/reset unit-normal per mesh so the global normal pixel shader
+		// + UnitNormalEnable flag cannot leak into neighbouring meshes (rocks/buildings
+		// turning pink when the camera reveals them). Skip unit-normal for SORT-flagged
+		// (transparent) meshes: their polygons are captured into the sorting pool with
+		// the current render_state, and the sorting flush re-applies UnitNormalEnable
+		// per polygon — a true flag here would make lightning/halo/particles flush with
+		// the unit-normal shader and shade their colour texture as a normal map (pink).
+		{
+			bool meshIsSorted = (!!mesh->Peek_Model()->Get_Flag(MeshGeometryClass::SORT)) && WW3D::Is_Sorting_Enabled();
+			bool terrainNormalActive = Is_D3D11_Backend_Active() &&
+				static_cast<D3D11Backend *>(g_renderBackend)->Is_Terrain_Normal_Active();
+			if (meshIsSorted) {
+				// Force the flag off for transparent meshes so the sorting pool
+				// captures UnitNormalEnable=false.
+				D3D11Backend * backend = static_cast<D3D11Backend *>(g_renderBackend);
+				backend->Set_Unit_Normal_Pixel_Shader(false);
+				backend->Set_Terrain_Normal_Pixel_Shader(false);
+				DX8Wrapper::Set_Unit_Normal_Enable(false);
+			} else {
+				W3DNext_UnitNormal_PerMesh(sh, isWorldDiffuse, terrainNormalActive);
+			}
 		}
 
 		/*
@@ -2215,6 +2589,11 @@ void DX8MeshRendererClass::Flush()
 
 	g_renderBackend->Set_Vertex_Buffer(nullptr);
 	g_renderBackend->Set_Index_Buffer(nullptr,0);
+
+	// W3DNext: clear the unit-normal flag after this category so the global
+	// state can never stay "true" into water/terrain/particle draws that don't
+	// pass through this function (previously caused the white flash/halo).
+	DX8Wrapper::Set_Unit_Normal_Enable(false);
 }
 
 
@@ -2289,6 +2668,18 @@ void DX8MeshRendererClass::Invalidate( bool shutdown)
 		texture_category_container_list_skin = W3DNEW FVFCategoryList;
 
 	texture_category_container_lists_rigid.Delete_All();
+}
+
+// W3DNext: shroud pass flag (set/unset by W3DShroudMaterialPassClass).
+bool g_w3dnextShroudPassActive = false;
+
+// W3DNext: clear the unit-normal state so the shroud pass doesn't inherit a
+// bound normal-map pipeline (which turns shrouded buildings pink/magenta).
+void W3DNext_D3D11_ClearUnitNormalForShroud(void)
+{
+	if (!Is_D3D11_Backend_Active())
+		return;
+	static_cast<D3D11Backend *>(g_renderBackend)->Set_Unit_Normal_Pixel_Shader(false);
 }
 
 

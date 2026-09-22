@@ -566,6 +566,44 @@ static Bool doSingleBoneName(RenderObjClass* robj, const AsciiString& boneName, 
 }
 
 //-------------------------------------------------------------------------------------------------
+// W3DNext: fallback model loader. Some mod INIs reference night/scuffed model variants
+// (e.g. "cbmogdis07_sn") whose .w3d file is missing from the art archive. When the exact
+// model cannot be loaded, try stripping a trailing "_s" (scuffed) suffix so the base night
+// model (e.g. "cbmogdis07_n") is used instead. This makes night textures / lit windows appear
+// even when the scuffed-night art is absent.
+static RenderObjClass* W3DNext_CreateRenderObjFallback(const AsciiString& name, Real scale, Int hex)
+{
+	RenderObjClass* robj = W3DDisplay::m_assetManager->Create_Render_Obj(name.str(), scale, hex);
+	if (robj)
+		return robj;
+
+	const char* n = name.str();
+	if (n && n[0])
+	{
+		char buf[256];
+		strncpy(buf, n, sizeof(buf) - 1);
+		buf[sizeof(buf) - 1] = 0;
+		size_t L = strlen(buf);
+		// try stripping a trailing "_s" (scuffed) suffix (e.g. cbmogdis07_sn -> cbmogdis07_n)
+		if (L > 3 && buf[L - 2] == '_' && buf[L - 1] == 's')
+		{
+			buf[L - 2] = 0;
+			robj = W3DDisplay::m_assetManager->Create_Render_Obj(buf, scale, hex);
+			if (robj)
+			{
+				char log[256];
+				std::snprintf(log, sizeof(log), "[D3D11] model fallback '%s' -> '%s'\n", n, buf);
+				OutputDebugStringA(log);
+				FILE* f = std::fopen("C:\\Users\\AFMRAYAN\\AppData\\Local\\Temp\\opencode\\unitnorm_toggle.log", "a");
+				if (f) { std::fprintf(f, "%s", log); std::fclose(f); }
+				return robj;
+			}
+		}
+	}
+	return nullptr;
+}
+
+//-------------------------------------------------------------------------------------------------
 void ModelConditionInfo::validateStuff(RenderObjClass* robj, Real scale, const std::vector<AsciiString>& extraPublicBones) const
 {
 // srj sez: hm, this doesn't make sense; I think we really do need to validate transition states.
@@ -620,7 +658,7 @@ void ModelConditionInfo::validateCachedBones(RenderObjClass* robj, Real scale) c
 			return;
 		}
 
-		robj = W3DDisplay::m_assetManager->Create_Render_Obj(m_modelName.str(), scale, 0);
+		robj = W3DNext_CreateRenderObjFallback(m_modelName, scale, 0);
 		DEBUG_ASSERTCRASH(robj, ("*** ASSET ERROR: Model %s not found!",m_modelName.str()));
 		if (!robj)
 		{
@@ -3024,7 +3062,7 @@ void W3DModelDraw::setModelState(const ModelConditionInfo* newState)
 		}
 		else
 		{
-			m_renderObject = W3DDisplay::m_assetManager->Create_Render_Obj(newState->m_modelName.str(), draw->getScale(), m_hexColor);
+			m_renderObject = W3DNext_CreateRenderObjFallback(newState->m_modelName, draw->getScale(), m_hexColor);
 			DEBUG_ASSERTCRASH(m_renderObject, ("*** ASSET ERROR: Model %s not found!",newState->m_modelName.str()));
 		}
 
@@ -3179,11 +3217,30 @@ void W3DModelDraw::replaceModelConditionState(const ModelConditionFlags& c)
 {
 	m_hideHeadlights = c.test(MODELCONDITION_NIGHT) ? false : true;
 
+	const ModelConditionInfo* prevInfo = m_curState;
 	const ModelConditionInfo* info = findBestInfo(c);
 	if (info)
 		setModelState(info);
 
 	hideAllHeadlights(m_hideHeadlights);
+
+	if (c.test(MODELCONDITION_NIGHT)) {
+		static int s_nightLog = 0;
+		if (s_nightLog < 80) {
+			const char *nm = m_renderObject ? m_renderObject->Get_Name() : "?";
+			const char *prevNm = prevInfo ? (prevInfo->m_modelName.str() ? prevInfo->m_modelName.str() : "?") : "null";
+			const char *newNm = info ? (info->m_modelName.str() ? info->m_modelName.str() : "?") : "null";
+			char buf[512];
+			bool isChurch = (nm && strstr(nm, "Church")) || (newNm && strstr(newNm, "Church")) || (prevNm && strstr(prevNm, "Church"));
+			if (isChurch || s_nightLog < 20) {
+				std::snprintf(buf, sizeof(buf), "[D3D11] NIGHT switch '%s' prev='%s' new='%s' info=%p\n", nm ? nm : "?", prevNm, newNm, (void*)info);
+				OutputDebugStringA(buf);
+				FILE *fl = std::fopen("C:\\Users\\AFMRAYAN\\AppData\\Local\\Temp\\opencode\\unitnorm_toggle.log", "a");
+				if (fl) { std::fprintf(fl, "%s", buf); std::fclose(fl); }
+			}
+			s_nightLog++;
+		}
+	}
 }
 
 //-------------------------------------------------------------------------------------------------

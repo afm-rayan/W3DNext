@@ -57,6 +57,7 @@
 #include "dx8indexbuffer.h"
 #include "dx8renderer.h"
 #include "Backend/RenderBackend.h"
+#include "Backend/D3D11Backend.h" // D3D11 render-target delegation (cast of g_renderBackend)
 #include "ww3d.h"
 #include "camera.h"
 #include "wwstring.h"
@@ -658,6 +659,14 @@ bool DX8Wrapper::Reset_Device(bool reload_assets)
 		Invalidate_Cached_Render_States();
 		Set_Default_Global_Render_States();
 		SHD_INIT_SHADERS;
+		// W3DNext D3D11: a device reset destroys the D3D8 surfaces the backend's
+		// upload cache was built over. Drop every cached D3D11 texture/SRV so the
+		// next bind re-uploads from the (recreated) D3D8 surface. The per-bind
+		// Init() in D3D11Backend::Set_Texture covers the non-reset invalidation
+		// path; this covers a full Reset_Device.
+		if (Is_D3D11_Backend_Active()) {
+			static_cast<D3D11Backend *>(g_renderBackend)->Release_Texture_Cache();
+		}
 		WWDEBUG_SAY(("Device reset completed"));
 		return true;
 	}
@@ -3300,6 +3309,13 @@ DX8Wrapper::Create_Render_Target (int width, int height, WW3DFormat format)
 	DX8_Assert();
 	DX8_RECORD_DX8_CALLS();
 
+	// W3DNext D3D11: the backend owns the real render-target textures. Delegate
+	// here so water reflection / projected shadows get a bindable D3D11 target
+	// instead of the (always-null under D3D11) legacy DX8 surface path below.
+	if (Is_D3D11_Backend_Active()) {
+		return static_cast<D3D11Backend *>(g_renderBackend)->Create_Render_Target(width, height, format);
+	}
+
 	// Use the current display format if format isn't specified
 	if (format==WW3D_FORMAT_UNKNOWN) {
 		D3DDISPLAYMODE mode;
@@ -3624,6 +3640,18 @@ void DX8Wrapper::Set_Render_Target
 {
 	DX8_THREAD_ASSERT();
 	DX8_Assert();
+
+	// W3DNext D3D11: restoring the default render target must ALSO restore the
+	// D3D11 backend's bound RT/DSV. The backend's Set_Render_Target_With_Z is
+	// what actually bound the reflection/shadow offscreen RT; if we only restore
+	// the (unused under D3D11) D3D8 device here, the backend keeps the offscreen
+	// RT bound and renders the whole main scene into it -> white/broken screen.
+	if (Is_D3D11_Backend_Active()) {
+		if (render_target == nullptr) {
+			static_cast<D3D11Backend *>(g_renderBackend)->Set_Render_Target_With_Z(nullptr, nullptr);
+		}
+		return;
+	}
 
 	//
 	//	Should we restore the default render target set a new one?

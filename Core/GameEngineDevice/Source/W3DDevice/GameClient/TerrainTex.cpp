@@ -53,6 +53,12 @@
 #include "Common/GlobalData.h"
 #include "WW3D2/dx8wrapper.h"
 #include "d3dx8tex.h"
+#include <stdio.h>
+
+static void normDBG(const char *msg) {
+	FILE *f = fopen("normaltrace.log", "a");
+	if (f) { fprintf(f, "%s\n", msg); fclose(f); }
+}
 
 /******************************************************************************
 						TerrainTextureClass
@@ -1144,6 +1150,403 @@ void ScorchTextureClass::Apply(unsigned int stage)
 
 	DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLOROP,   D3DTOP_DISABLE );
 	DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ALPHAOP,   D3DTOP_DISABLE );
+}
+
+/******************************************************************************
+						NormalMapTerrainTextureClass
+******************************************************************************/
+//-----------------------------------------------------------------------------
+//         Public Functions
+//-----------------------------------------------------------------------------
+
+//=============================================================================
+// NormalMapTerrainTextureClass::NormalMapTerrainTextureClass
+//=============================================================================
+/** Constructor. Creates a 32 bit per pixel D3D texture to hold normal vectors
+ (A8R8G8B8), high precision so the RGB normal values are preserved. */
+//=============================================================================
+NormalMapTerrainTextureClass::NormalMapTerrainTextureClass(int height) :
+	TextureClass(TEXTURE_WIDTH, height, WW3D_FORMAT_A8R8G8B8, MIP_LEVELS_3 )
+{
+}
+
+//=============================================================================
+// NormalMapTerrainTextureClass::NormalMapTerrainTextureClass
+//=============================================================================
+/** Constructor. Creates a 32 bpp texture with an explicit width/height. */
+//=============================================================================
+NormalMapTerrainTextureClass::NormalMapTerrainTextureClass(int height, int width) :
+	TextureClass(width, height, WW3D_FORMAT_A8R8G8B8, MIP_LEVELS_ALL )
+{
+}
+
+//=============================================================================
+// NormalMapTerrainTextureClass::update
+//=============================================================================
+/** Copies the parallel normal-map tile data into the texture, at the exact same
+ positions the base color tiles are placed.  Reuses getSourceTile()'s stored
+ m_tileLocationInTexture but pulls pixel data from the _n tile array. */
+//=============================================================================
+int NormalMapTerrainTextureClass::update(WorldHeightMap *htMap)
+{
+	normDBG("NORMAL update enter");
+	IDirect3DSurface8 *surface_level;
+	D3DSURFACE_DESC surface_desc;
+	D3DLOCKED_RECT locked_rect;
+	DX8_ErrorCode(Peek_D3D_Texture()->GetSurfaceLevel(0, &surface_level));
+	DX8_ErrorCode(surface_level->GetDesc(&surface_desc));
+	if (surface_desc.Width < TEXTURE_WIDTH) {
+		return 0;
+	}
+
+	DX8_ErrorCode(surface_level->LockRect(&locked_rect, NULL, 0));
+
+	Int tilePixelExtent = TILE_PIXEL_EXTENT;
+	if (surface_desc.Format == D3DFMT_A8R8G8B8 || surface_desc.Format == D3DFMT_X8R8G8B8) {
+		Int tileNdx;
+		Int pixelBytes = 4;
+		for (tileNdx=0; tileNdx < htMap->m_numBitmapTiles; tileNdx++) {
+			TileData *pNormalTile = htMap->getNormalSourceTile(tileNdx);
+			if (!pNormalTile) { normDBG("NORMAL tile loop: normal==NULL"); continue; }
+			TileData *pSrcTile = htMap->getSourceTile(tileNdx);
+			if (!pSrcTile) { normDBG("NORMAL tile loop: src==NULL"); continue; }
+			ICoord2D position = pSrcTile->m_tileLocationInTexture;
+			if (position.x<=0) continue; // all real tile offsets start at 2.  jba.
+
+			Int i,j;
+			for (j=0; j<tilePixelExtent; j++) {
+				UnsignedByte *pBGR = pNormalTile->getRGBDataForWidth(tilePixelExtent);
+				pBGR += (tilePixelExtent-1-j)*TILE_BYTES_PER_PIXEL*tilePixelExtent; // invert to match.
+				Int row = position.y+j;
+				UnsignedByte *pBGRX = ((UnsignedByte*)locked_rect.pBits) +
+							(row)*surface_desc.Width*pixelBytes;
+
+				Int column = position.x;
+				pBGRX += column*pixelBytes;
+				for (i=0; i<tilePixelExtent; i++) {
+					// tile data is BGRA, texture wants RGBA
+					// TheSuperHackers @feature normalmap depth: push the X/Y (tangent) channels
+					// away from mid-gray so bumps read deeper.  k=1 -> unchanged.
+					const float DEPTH_K = 1.0f;
+					Int nR = pBGR[2];
+					Int nG = pBGR[1];
+					if (DEPTH_K != 1.0f) {
+						nR = (Int)(128.0f + (nR - 128.0f) * DEPTH_K);
+						nG = (Int)(128.0f + (nG - 128.0f) * DEPTH_K);
+						if (nR < 0) nR = 0; else if (nR > 255) nR = 255;
+						if (nG < 0) nG = 0; else if (nG > 255) nG = 255;
+					}
+					pBGRX[0] = (UnsignedByte)nR;	// r
+					pBGRX[1] = (UnsignedByte)nG;	// g
+					pBGRX[2] = pBGR[0];	// b
+					pBGRX[3] = 0xff;	// a
+					pBGRX +=pixelBytes;
+					pBGR +=TILE_BYTES_PER_PIXEL;
+				}
+			}
+		}
+		// Draw the 4 pixel border around each tile class, just like the base atlas.
+		Int texClass;
+		for (texClass=0; texClass<htMap->m_numTextureClasses; texClass++) {
+			Int width = htMap->m_textureClasses[texClass].width;
+			ICoord2D origin = htMap->m_textureClasses[texClass].positionInTexture;
+			if (origin.x<=0) continue;
+			width *= TILE_PIXEL_EXTENT;
+			Int j;
+			for (j=0; j<width; j++) {
+				Int row = origin.y+j;
+				UnsignedByte *pBGRX = ((UnsignedByte*)locked_rect.pBits) +
+							(row)*surface_desc.Width*pixelBytes;
+
+				Int column = origin.x;
+				pBGRX += column*pixelBytes;
+				// copy before
+				memcpy(pBGRX-(4)*pixelBytes, pBGRX+(width-4)*pixelBytes, 4*pixelBytes);
+				// copy after
+				memcpy(pBGRX+(width*pixelBytes), pBGRX, 4*pixelBytes);
+			}
+
+			// Duplicate 4 rows of pixels before and after.
+			for (j=0; j<4; j++) {
+				// copy before.
+				Int row = origin.y-j-1;
+				UnsignedByte *pBGRX = ((UnsignedByte*)locked_rect.pBits) +
+							(row)*surface_desc.Width*pixelBytes;
+				UnsignedByte *target = pBGRX+(origin.x-4)*pixelBytes;
+				memcpy(target, target+width*surface_desc.Width*pixelBytes, (width+8)*pixelBytes);
+				// copy after.
+				row = origin.y+j;
+				pBGRX = ((UnsignedByte*)locked_rect.pBits) +
+							(row)*surface_desc.Width*pixelBytes;
+				target = pBGRX+(origin.x-4)*pixelBytes;
+				memcpy(target+width*surface_desc.Width*pixelBytes, target, (width+8)*pixelBytes);
+			}
+		}
+	}
+	surface_level->UnlockRect();
+	surface_level->Release();
+	// Generate proper, normal-preserving mip levels for the normal atlas.
+	// Box-averaging the packed RGB (D3DX_FILTER_BOX) drives every normal toward
+	// (0,0,1) and flattens terrain relief at distance / lower resolution. Point
+	// filtering (D3DX_FILTER_POINT) keeps relief but looks blocky / coarse.
+	// Instead we average the *unpacked* tangent-space normals over each 2x2
+	// block, then renormalize. This preserves each tile's characteristic bump
+	// at every mip level (no flattening) while staying smooth (no blockiness).
+	// Runs once at atlas build time, so cost is irrelevant to frame rate.
+	IDirect3DTexture8 *pNormTex = Peek_D3D_Texture();
+	if (pNormTex) {
+		D3DSURFACE_DESC sd0;
+		ZeroMemory(&sd0, sizeof(sd0));
+		IDirect3DSurface8 *s0 = NULL;
+		if (SUCCEEDED(pNormTex->GetSurfaceLevel(0, &s0))) {
+			s0->GetDesc(&sd0);
+			s0->Release();
+			s0 = NULL;
+		}
+		const Int numLevels = pNormTex->GetLevelCount();
+		if (numLevels > 1 && sd0.Width > 0 && sd0.Height > 0) {
+			Int w = sd0.Width, h = sd0.Height;
+			float *cur = new float[(size_t)w * h * 3];
+			// Read mip 0 as unpacked float normals (texture's own RGB byte order).
+			IDirect3DSurface8 *src = NULL;
+			if (SUCCEEDED(pNormTex->GetSurfaceLevel(0, &src))) {
+				D3DLOCKED_RECT lr;
+				if (SUCCEEDED(src->LockRect(&lr, NULL, D3DLOCK_READONLY))) {
+					for (Int y = 0; y < h; y++) {
+						const UnsignedByte *row = ((const UnsignedByte*)lr.pBits) + (size_t)y * lr.Pitch;
+						for (Int x = 0; x < w; x++) {
+							const Int i = (y * w + x) * 3;
+							cur[i + 0] = row[x * 4 + 0] / 255.0f * 2.0f - 1.0f;
+							cur[i + 1] = row[x * 4 + 1] / 255.0f * 2.0f - 1.0f;
+							cur[i + 2] = row[x * 4 + 2] / 255.0f * 2.0f - 1.0f;
+						}
+					}
+					src->UnlockRect();
+				}
+				src->Release();
+			}
+			for (Int L = 1; L < numLevels; L++) {
+				const Int nw = (w >> 1) > 0 ? (w >> 1) : 1;
+				const Int nh = (h >> 1) > 0 ? (h >> 1) : 1;
+				float *nxt = new float[(size_t)nw * nh * 3];
+				for (Int y = 0; y < nh; y++) {
+					for (Int x = 0; x < nw; x++) {
+						float nx = 0.0f, ny = 0.0f, nz = 0.0f;
+						for (Int dy = 0; dy < 2; dy++) {
+							for (Int dx = 0; dx < 2; dx++) {
+								const Int sx = min(w - 1, x * 2 + dx);
+								const Int sy = min(h - 1, y * 2 + dy);
+								const Int si = (sy * w + sx) * 3;
+							nx += cur[si]; ny += cur[si + 1]; nz += cur[si + 2];
+						}
+					}
+					// Average of the 2x2 block (sum/4).
+					nx *= 0.25f; ny *= 0.25f; nz *= 0.25f;
+					// Calm the bump at lower mip levels so it does not alias /
+					// shimmer (flicker) when the mip LOD transitions during camera
+					// movement. The average already reduces direction variance;
+					// this extra attenuation prevents full-strength bumps that
+					// sparkle on detailed tiles (rocks/pebbles) at distance.
+					const float bumpAtten = 1.0f / (1.0f + 0.75f * (float)L);
+					nx *= bumpAtten; ny *= bumpAtten;
+					const float len = sqrtf(nx * nx + ny * ny + nz * nz);
+					if (len > 1e-6f) { nx /= len; ny /= len; nz /= len; }
+						const Int di = (y * nw + x) * 3;
+						nxt[di] = nx; nxt[di + 1] = ny; nxt[di + 2] = nz;
+					}
+				}
+				IDirect3DSurface8 *dst = NULL;
+				if (SUCCEEDED(pNormTex->GetSurfaceLevel(L, &dst))) {
+					D3DLOCKED_RECT lr;
+					if (SUCCEEDED(dst->LockRect(&lr, NULL, 0))) {
+						for (Int y = 0; y < nh; y++) {
+							UnsignedByte *row = ((UnsignedByte*)lr.pBits) + (size_t)y * lr.Pitch;
+							for (Int x = 0; x < nw; x++) {
+								const Int si = (y * nw + x) * 3;
+								float r0 = (nxt[si] * 0.5f + 0.5f) * 255.0f;
+								float r1 = (nxt[si + 1] * 0.5f + 0.5f) * 255.0f;
+								float r2 = (nxt[si + 2] * 0.5f + 0.5f) * 255.0f;
+								row[x * 4 + 0] = (UnsignedByte)(r0 < 0 ? 0 : (r0 > 255 ? 255 : r0));
+								row[x * 4 + 1] = (UnsignedByte)(r1 < 0 ? 0 : (r1 > 255 ? 255 : r1));
+								row[x * 4 + 2] = (UnsignedByte)(r2 < 0 ? 0 : (r2 > 255 ? 255 : r2));
+								row[x * 4 + 3] = 0xff;
+							}
+						}
+						dst->UnlockRect();
+					}
+					dst->Release();
+				}
+				delete[] cur;
+				cur = nxt;
+				w = nw; h = nh;
+			}
+			delete[] cur;
+		}
+	}
+	if (WW3D::Get_Texture_Reduction()) {
+		Peek_D3D_Texture()->SetLOD(WW3D::Get_Texture_Reduction());
+	}
+	return(surface_desc.Height);
+}
+
+//=============================================================================
+// NormalMapTerrainTextureClass::setLOD
+//=============================================================================
+void NormalMapTerrainTextureClass::setLOD(Int LOD)
+{
+	if (Peek_D3D_Texture()) Peek_D3D_Texture()->SetLOD(LOD);
+}
+
+//=============================================================================
+// NormalMapTerrainTextureClass::Apply
+//=============================================================================
+void NormalMapTerrainTextureClass::Apply(unsigned int stage)
+{
+	// Do the base apply.  Normal maps use wrap + bilinear filtering so detail
+	// remains crisp; coordinate index is left as the base terrain texcoord set.
+	TextureClass::Apply(stage);
+}
+
+/******************************************************************************
+						NormalMapEdgeTextureClass
+******************************************************************************/
+//-----------------------------------------------------------------------------
+//         Public Functions
+//-----------------------------------------------------------------------------
+
+//=============================================================================
+// NormalMapEdgeTextureClass::NormalMapEdgeTextureClass
+//=============================================================================
+/** Constructor. Creates a 32 bit per pixel D3D texture to hold normal vectors
+ (A8R8G8B8), high precision so the RGB normal values are preserved. */
+//=============================================================================
+NormalMapEdgeTextureClass::NormalMapEdgeTextureClass(int height, MipCountType mipLevelCount) :
+	TextureClass(TEXTURE_WIDTH, height, WW3D_FORMAT_A8R8G8B8, mipLevelCount )
+{
+}
+
+//=============================================================================
+// NormalMapEdgeTextureClass::update256
+//=============================================================================
+int NormalMapEdgeTextureClass::update256(WorldHeightMap *htMap)
+{
+	return 1;
+}
+
+//=============================================================================
+// NormalMapEdgeTextureClass::update
+//=============================================================================
+/** Builds the normal-map edge blend texture.  Uses the same layout as
+ AlphaEdgeTextureClass so UV coordinates match.  Alpha channel contains the
+ blend mask; RGB is neutral normal (flat).  Shader will sample two normal maps
+ from the main atlas and lerp using this alpha. */
+//=============================================================================
+int NormalMapEdgeTextureClass::update(WorldHeightMap *htMap)
+{
+	IDirect3DSurface8 *surface_level;
+	D3DSURFACE_DESC surface_desc;
+	D3DLOCKED_RECT locked_rect;
+	DX8_ErrorCode(Peek_D3D_Texture()->GetSurfaceLevel(0, &surface_level));
+	DX8_ErrorCode(surface_level->LockRect(&locked_rect, NULL, 0));
+	DX8_ErrorCode(surface_level->GetDesc(&surface_desc));
+
+	Int tilePixelExtent = TILE_PIXEL_EXTENT; // blend tiles are 1/4 tiles.
+
+	if (surface_desc.Format == D3DFMT_A8R8G8B8) {
+		Int pixelBytes = 4;
+
+		// First fill entire texture with neutral normal (flat)
+		for (Int y = 0; y < surface_desc.Height; y++) {
+			UnsignedByte *pBGRX = ((UnsignedByte*)locked_rect.pBits) + y * surface_desc.Width * pixelBytes;
+			for (Int x = 0; x < surface_desc.Width; x++) {
+				pBGRX[0] = 128; // R = 0
+				pBGRX[1] = 128; // G = 0
+				pBGRX[2] = 255; // B = 1 (up)
+				pBGRX[3] = 0;   // alpha = 0 (no blend)
+				pBGRX += pixelBytes;
+			}
+		}
+
+		// Copy alpha masks from edge tiles (same as AlphaEdgeTextureClass)
+		for (Int tileNdx = 0; tileNdx < htMap->m_numEdgeTiles; tileNdx++) {
+			TileData *pTile = htMap->getEdgeTile(tileNdx);
+			if (!pTile) continue;
+			ICoord2D position = pTile->m_tileLocationInTexture;
+			if (position.x <= 0) continue;
+
+			Int column = position.x;
+			for (Int j = 0; j < tilePixelExtent; j++) {
+				Int row = position.y + j;
+				UnsignedByte *pSrcBGR = htMap->getEdgeTile(tileNdx)->getRGBDataForWidth(tilePixelExtent);
+				pSrcBGR += (tilePixelExtent - 1 - j) * TILE_BYTES_PER_PIXEL * tilePixelExtent;
+				UnsignedByte *pDstBGRX = ((UnsignedByte*)locked_rect.pBits) + row * surface_desc.Width * pixelBytes;
+				pDstBGRX += column * pixelBytes;
+
+				for (Int i = 0; i < tilePixelExtent; i++) {
+					// Copy alpha from edge tile (same logic as AlphaEdgeTextureClass)
+					if (pSrcBGR[0] == 0 && pSrcBGR[1] == 0 && pSrcBGR[2] == 0) {
+						pDstBGRX[3] = 0x80;
+					} else if (pSrcBGR[0] == 0xff && pSrcBGR[1] == 0xff && pSrcBGR[2] == 0xff) {
+						pDstBGRX[3] = 0x00;
+					} else {
+						pDstBGRX[3] = 0xff;
+					}
+					pDstBGRX += pixelBytes;
+					pSrcBGR += TILE_BYTES_PER_PIXEL;
+				}
+			}
+		}
+
+		// Duplicate 4-pixel borders around each texture class (same as base atlas)
+		for (Int texClass = 0; texClass < htMap->m_numEdgeTextureClasses; texClass++) {
+			Int width = htMap->m_edgeTextureClasses[texClass].width;
+			ICoord2D origin = htMap->m_edgeTextureClasses[texClass].positionInTexture;
+			if (origin.x <= 0) continue;
+			width *= TILE_PIXEL_EXTENT;
+
+			// Duplicate 4 columns before and after
+			for (Int j = 0; j < width; j++) {
+				Int row = origin.y + j;
+				UnsignedByte *pBGRX = ((UnsignedByte*)locked_rect.pBits) + row * surface_desc.Width * pixelBytes;
+				Int column = origin.x;
+				pBGRX += column * pixelBytes;
+				memcpy(pBGRX - 4 * pixelBytes, pBGRX + (width - 4) * pixelBytes, 4 * pixelBytes);
+				memcpy(pBGRX + width * pixelBytes, pBGRX, 4 * pixelBytes);
+			}
+
+			// Duplicate 4 rows before and after
+			for (Int j = 0; j < 4; j++) {
+				Int row = origin.y - j - 1;
+				UnsignedByte *pBGRX = ((UnsignedByte*)locked_rect.pBits) + row * surface_desc.Width * pixelBytes;
+				UnsignedByte *target = pBGRX + (origin.x - 4) * pixelBytes;
+				memcpy(target, target + width * surface_desc.Width * pixelBytes, (width + 8) * pixelBytes);
+				row = origin.y + j;
+				pBGRX = ((UnsignedByte*)locked_rect.pBits) + row * surface_desc.Width * pixelBytes;
+				target = pBGRX + (origin.x - 4) * pixelBytes;
+				memcpy(target + width * surface_desc.Width * pixelBytes, target, (width + 8) * pixelBytes);
+			}
+		}
+	}
+
+	surface_level->UnlockRect();
+	surface_level->Release();
+	DX8_ErrorCode(D3DXFilterTexture(Peek_D3D_Texture(), NULL, 0, D3DX_FILTER_BOX));
+	return surface_desc.Height;
+}
+
+void NormalMapEdgeTextureClass::Apply(unsigned int stage)
+{
+	TextureClass::Apply(stage);
+	DX8Wrapper::Set_DX8_Texture_Stage_State(stage, D3DTSS_MINFILTER, D3DTEXF_LINEAR);
+	DX8Wrapper::Set_DX8_Texture_Stage_State(stage, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
+	DX8Wrapper::Set_DX8_Texture_Stage_State(stage, D3DTSS_MIPFILTER, D3DTEXF_LINEAR);
+	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ADDRESSU, D3DTADDRESS_CLAMP);
+	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ADDRESSV, D3DTADDRESS_CLAMP);
+}
+
+void NormalMapEdgeTextureClass::setLOD(Int LOD)
+{
+	if (Peek_D3D_Texture()) Peek_D3D_Texture()->SetLOD(LOD);
 }
 
 

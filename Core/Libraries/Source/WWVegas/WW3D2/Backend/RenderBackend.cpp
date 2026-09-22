@@ -111,3 +111,77 @@ void Shutdown_Render_Backend()
 	delete g_renderBackend;
 	g_renderBackend = nullptr;
 }
+
+// --- Diagnostic mode (F11 hotkey, polled in D3D11Backend::Begin_Scene) -------
+volatile int g_w3dnextDiagMode = 0;
+
+const char * W3DNext_Diag_Mode_Name(int mode)
+{
+	switch (mode) {
+	case 0: return "0=NORMAL (all on)";
+	case 1: return "1=WATER OFF";
+	case 2: return "2=SCREEN FILTERS OFF";
+	case 3: return "3=UNIT NORMALMAP OFF";
+	case 4: return "4=ALL SUSPECTS OFF (water+filters+normals)";
+	default: return "?";
+	}
+}
+
+// Snapshot the debug logs for the given mode into debug_snapshot_modeN.log so
+// every keypress leaves a diffable record (the perf log, the unit-normal probe
+// log, and the terrain normal atlas log). Sources may be momentarily held open
+// by the live backend; unreadable ones are noted as "(locked)" rather than
+// aborting the snapshot.
+static void Snapshot_Debug(int mode, const char * modeName)
+{
+	const char * sources[] = { "d3d11_backend.log", "unitnorm.log", "normaltrace.log" };
+	char snapName[MAX_PATH];
+	std::snprintf(snapName, sizeof(snapName), "debug_snapshot_mode%d.log", mode);
+	FILE * out = std::fopen(snapName, "w");
+	if (out == nullptr) {
+		return;
+	}
+	std::fprintf(out, "=== debug_snapshot mode %d : %s ===\n", mode, modeName);
+	for (int i = 0; i < 3; ++i) {
+		std::fprintf(out, "\n----- %s -----\n", sources[i]);
+		FILE * in = std::fopen(sources[i], "rb");
+		if (in) {
+			char buf[256];
+			size_t n;
+			while ((n = std::fread(buf, 1, sizeof(buf), in)) > 0) {
+				std::fwrite(buf, 1, n, out);
+			}
+			std::fclose(in);
+		} else {
+			std::fprintf(out, "(locked/unavailable)\n");
+		}
+	}
+	std::fclose(out);
+}
+
+void Set_W3DNext_Diag_Mode(int mode)
+{
+	if (mode < 0) mode = 0;
+	if (mode > 4) mode = 4;
+	g_w3dnextDiagMode = mode;
+
+	const char * name = W3DNext_Diag_Mode_Name(mode);
+	FILE * f = std::fopen("diagmode.txt", "w");
+	if (f) {
+		std::fprintf(f, "diagMode=%d  %s\n", mode, name);
+		std::fclose(f);
+	}
+	char diagLog[256];
+	std::snprintf(diagLog, sizeof(diagLog), "[RenderBackend] diag mode -> %s", name);
+	RB_Log_Line(diagLog);
+
+	// Diagnostic note: mode 1 disables water (W3DWater.cpp early-out), mode 2 the
+	// screen-filter quad, mode 3 unit normal-mapping, mode 4 all three. Each press
+	// is a self-contained on/off test - if the artifact survives mode 4 it lives in
+	// a base pass (terrain/FOW/decal/sky) outside the diag gates.
+	if (mode == 1) {
+		RB_Log_Line("[RenderBackend] WATER OFF (mode 1): water render gated at W3DWater::Render - artifact still present means it is NOT water.");
+	}
+
+	Snapshot_Debug(mode, name);
+}

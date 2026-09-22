@@ -332,6 +332,14 @@ void W3DPropBuffer::drawProps(RenderInfoClass &rinfo)
 	LightEnvironmentClass lightEnv;
 	Vector3 center(0,0,0); // arbitrary center point. [6/6/2003]
 	Vector3 ambient(objectLighting[0].ambient.red, objectLighting[0].ambient.green, objectLighting[0].ambient.blue);
+	// W3DNext: props at night use night models with self-illuminated windows,
+	// but the night light environment is very dark (ambient ~0.15). Boost so
+	// night textures (lit windows) stay visible. Stronger boost than before.
+	if (TheGlobalData->m_timeOfDay == TIME_OF_DAY_NIGHT) {
+		ambient.X = min(ambient.X + 0.65f, 0.90f);
+		ambient.Y = min(ambient.Y + 0.60f, 0.85f);
+		ambient.Z = min(ambient.Z + 0.50f, 0.75f);
+	}
 	lightEnv.Reset(center, ambient);
 
 	Matrix3D mtx;
@@ -373,13 +381,16 @@ void W3DPropBuffer::drawProps(RenderInfoClass &rinfo)
 		if (m_props[i].ss <= OBJECTSHROUD_INVALID) {
 			continue;
 		}
-		if (TheTerrainRenderObject->getShroud() && m_props[i].ss != CELLSHROUD_CLEAR) {
-			rinfo.Push_Material_Pass(m_propShroudMaterialPass);
+		// W3DNext NUCLEAR: keep props visible through fog to avoid pink (same as objects).
+		// Original shroud darkening via m_propShroudMaterialPass produces pink for many props
+		// due to broken _PresetMultiplicativeSprite emulation. For now bypass it.
+		// if (TheTerrainRenderObject->getShroud() && m_props[i].ss != CELLSHROUD_CLEAR) {
+		// 	rinfo.Push_Material_Pass(m_propShroudMaterialPass);
+		// 	m_props[i].m_robj->Render(rinfo);
+		// 	rinfo.Pop_Material_Pass();
+		// } else {
 			m_props[i].m_robj->Render(rinfo);
-			rinfo.Pop_Material_Pass();
-		} else {
-			m_props[i].m_robj->Render(rinfo);
-		}
+		// }
 	}
 	rinfo.light_environment = nullptr;
 

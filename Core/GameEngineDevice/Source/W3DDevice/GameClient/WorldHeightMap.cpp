@@ -52,6 +52,87 @@
 #include "W3DDevice/GameClient/W3DShadow.h"
 
 #include "Common/file.h"
+#include <stdio.h>
+
+static void normDBG(const char *msg) {
+	FILE *f = fopen("normaltrace.log", "a");
+	if (f) { fprintf(f, "%s\n", msg); fclose(f); }
+}
+
+#pragma pack(push, 1)
+struct NormalMapDDSHeader
+{
+	DWORD	dwMagic;		// "DDS "
+	DWORD	dwSize;			// size of DDSURFACEDESC2 structure (124)
+	DWORD	dwFlags;		// caps, height, width, pitch, pixelformat
+	DWORD	dwHeight;
+	DWORD	dwWidth;
+	DWORD	dwPitchOrLinearSize;
+	DWORD	dwDepth;
+	DWORD	dwMipMapCount;
+	DWORD	dwReserved1[11];
+	DWORD	ddpfSize;		// pixel format struct size (32)
+	DWORD	ddpfFlags;
+	DWORD	ddpfFourCC;
+	DWORD	ddpfRGBBitCount;
+	DWORD	ddpfRBitMask;
+	DWORD	ddpfGBitMask;
+	DWORD	ddpfBBitMask;
+	DWORD	ddpfABitMask;
+	DWORD	dwCaps[4];
+	DWORD	dwReserved2;
+};
+#pragma pack(pop)
+
+Bool WorldHeightMap::readTilesDDS(InputStream *pStr, TileData **tiles, Int numRows)
+{
+	NormalMapDDSHeader hdr;
+	Int len = pStr->read(&hdr, sizeof(hdr));
+	if (len != sizeof(hdr) || hdr.dwMagic != 0x20534444 /* 'DDS ' */) {
+		return(false);
+	}
+	// Only support uncompressed 24-bit RGB (what our _n files are).
+	if ((hdr.ddpfFlags & 0x00000004 /* DDPF_FOURCC */) || hdr.ddpfRGBBitCount != 24) {
+		return(false);
+	}
+	Int tileWidth = hdr.dwWidth/TILE_PIXEL_EXTENT;
+	Int tileHeight = hdr.dwHeight/TILE_PIXEL_EXTENT;
+	if (tileWidth<numRows || tileHeight<numRows) {
+		return(false);
+	}
+	Int bytesPerPixel = hdr.ddpfRGBBitCount/8;
+	Int i;
+	for (i=0; i<numRows*numRows; i++) {
+		if (tiles[i] == NULL)
+			tiles[i] = MSGNEW("WorldHeightMap_readTilesDDS") TileData;
+	}
+
+	// Read the full image rows sequentially.  Rows map 1:1 to readTiles' layout.
+	UnsignedByte *rowBuf = new UnsignedByte[hdr.dwWidth*bytesPerPixel];
+	Int row, column;
+	for (row = 0; row < numRows*TILE_PIXEL_EXTENT; row++) {
+		UnsignedInt readLen = pStr->read(rowBuf, hdr.dwWidth*bytesPerPixel);
+		if (readLen < hdr.dwWidth*bytesPerPixel) {
+			delete[] rowBuf;
+			return(false);
+		}
+		for (column = 0; column < numRows*TILE_PIXEL_EXTENT; column++) {
+			Int tileNdx = (column/TILE_PIXEL_EXTENT) + numRows*(row/TILE_PIXEL_EXTENT);
+			Int pixelNdx = (column%TILE_PIXEL_EXTENT) + TILE_PIXEL_EXTENT*(row%TILE_PIXEL_EXTENT);
+			UnsignedByte *pixel = tiles[tileNdx]->getDataPtr();
+			pixel += pixelNdx*TILE_BYTES_PER_PIXEL;
+			pixel[0] = rowBuf[column*bytesPerPixel+2];	// b
+			pixel[1] = rowBuf[column*bytesPerPixel+1];	// g
+			pixel[2] = rowBuf[column*bytesPerPixel+0];	// r
+			pixel[3] = 255;
+		}
+	}
+	delete[] rowBuf;
+	for (i=0; i<numRows*numRows; i++) {
+		tiles[i]->updateMips();
+	}
+	return(true);
+}
 
 
 #define K_OBSOLETE_HEIGHT_MAP_VERSION 8
@@ -404,6 +485,7 @@ WorldHeightMap::~WorldHeightMap()
 	for (i=0; i<NUM_SOURCE_TILES; i++) {
 		REF_PTR_RELEASE(m_sourceTiles[i]);
 		REF_PTR_RELEASE(m_edgeTiles[i]);
+		REF_PTR_RELEASE(m_normalSourceTiles[i]);
 	}
 	for (i=0; i<NUM_ALPHA_TILES; i++) {
 		REF_PTR_RELEASE(m_alphaTiles[i]);
@@ -411,6 +493,7 @@ WorldHeightMap::~WorldHeightMap()
 	REF_PTR_RELEASE(m_terrainTex);
 	REF_PTR_RELEASE(m_alphaTerrainTex);
 	REF_PTR_RELEASE(m_alphaEdgeTex);
+	REF_PTR_RELEASE(m_normalTerrainTex);
 }
 
 void WorldHeightMap::freeListOfMapObjects()
@@ -440,12 +523,13 @@ WorldHeightMap::WorldHeightMap():
 	m_tileMode(TILE_4x4),
 #endif
 	m_numCliffInfo(1),
-	m_terrainTex(nullptr), m_alphaTerrainTex(nullptr), m_numBitmapTiles(0), m_numBlendedTiles(1)
+	m_terrainTex(nullptr), m_alphaTerrainTex(nullptr), m_normalTerrainTex(nullptr), m_normalTerrainTexHeight(0), m_hasNormalMap(false), m_numBitmapTiles(0), m_numBlendedTiles(1)
 {
 	Int i;
 	for (i=0; i<NUM_SOURCE_TILES; i++) {
 		m_sourceTiles[i] = nullptr;
 		m_edgeTiles[i] = nullptr;
+		m_normalSourceTiles[i] = nullptr;
 	}
 
 	TheSidesList->validateSides();
@@ -479,13 +563,14 @@ WorldHeightMap::WorldHeightMap(ChunkInputStream *pStrm, Bool logicalDataOnly):
 	m_tileMode(TILE_4x4),
 #endif
 	m_numCliffInfo(1),
-	m_terrainTex(nullptr), m_alphaTerrainTex(nullptr), m_numBitmapTiles(0), m_numBlendedTiles(1)
+	m_terrainTex(nullptr), m_alphaTerrainTex(nullptr), m_normalTerrainTex(nullptr), m_normalTerrainTexHeight(0), m_hasNormalMap(false), m_numBitmapTiles(0), m_numBlendedTiles(1)
 {
 
 	int i;
 	for (i=0; i<NUM_SOURCE_TILES; i++) {
 		m_sourceTiles[i]=nullptr;
 		m_edgeTiles[i]=nullptr;
+		m_normalSourceTiles[i]=nullptr;
 	}
 	if (TheGlobalData && TheGlobalData->m_stretchTerrain) {
 		m_drawWidthX=STRETCH_DRAW_WIDTH;
@@ -1111,6 +1196,7 @@ Bool WorldHeightMap::ParseBlendTileData(DataChunkInput &file, DataChunkInfo *inf
 
 		m_textureClasses[i].name = file.readAsciiString();
 		readTexClass(&m_textureClasses[i], m_sourceTiles);
+		readTexClassNormal(&m_textureClasses[i], m_normalSourceTiles);
 	}
 	m_numEdgeTextureClasses = 0;
 	m_numEdgeTiles = 0;
@@ -2180,6 +2266,176 @@ TextureClass *WorldHeightMap::getEdgeTerrainTexture()
 		getTerrainTexture();
 	}
 	return m_alphaEdgeTex;
+}
+
+/** Read the parallel normal-map (_n.dds) tiles for a texture class into the normal tile array.
+ The normal tiles are raw 24-bit RGB DDS, same WxH as the base .tga, and are split into
+ the same 64px grid so they map 1:1 onto the base tiles. */
+void WorldHeightMap::readTexClassNormal(TXTextureClass *texClass, TileData **tileData)
+{
+	normDBG("NORMAL readTexClass enter");
+	char texturePath[ _MAX_PATH ];
+	texturePath[0] = 0;
+	File *theFile = NULL;
+
+	TerrainType *terrain = TheTerrainTypes->findTerrain( texClass->name );
+	if (terrain!=NULL)
+	{
+		// Build "<textureName>_n.dds" from the base terrain texture (e.g. "TMDirt01a.tga").
+		char base[ _MAX_PATH ];
+		strcpy(base, terrain->getTexture().str());
+		char *dot = strrchr(base, '.');
+		if (dot) *dot = 0;
+		sprintf( texturePath, "%s%s_n.dds", TERRAIN_TGA_DIR_PATH, base );
+		theFile = TheFileSystem->openFile( texturePath, File::READ|File::BINARY);
+	}
+
+	if (theFile != NULL) {
+		GDIFileStream theStream(theFile);
+		InputStream *pStr = &theStream;
+
+		// readTilesDDS parses the DDS header itself and reads the payload.
+		// Determine how many tiles this texture class actually uses (side count).
+		Int width = 0;
+		{
+			Int numTiles = texClass->numTiles;
+			Int wt;
+			for (wt = 10; wt >= 1; wt--) {
+				if (numTiles >= wt*wt) {
+					width = wt;
+					break;
+				}
+			}
+		}
+		if (width >= 1 && WorldHeightMap::readTilesDDS(pStr, tileData+texClass->firstTile, width)) {
+			m_hasNormalMap = true;
+		}
+		else {
+			normDBG("NORMAL readTexClass: readTilesDDS failed");
+		}
+		theFile->close();
+	}
+}
+
+// DBG: capture the access-violation code/address from the normal-texture ctor (uses a
+// vectored handler so it works without /EHa; we only record globals, no file I/O in the handler).
+static unsigned long g_dbg_av_code = 0;
+static void *g_dbg_av_addr = nullptr;
+static void *g_dbg_veh_handle = nullptr;
+static LONG WINAPI dbg_veh_handler(EXCEPTION_POINTERS *ep)
+{
+	if (ep && ep->ExceptionRecord && ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+		g_dbg_av_code = ep->ExceptionRecord->ExceptionCode;
+		g_dbg_av_addr = ep->ExceptionRecord->ExceptionAddress;
+	}
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+
+TextureClass *WorldHeightMap::getNormalTerrainTexture(void)
+{
+	if (!m_hasNormalMap) {
+		return NULL;
+	}
+	if (m_normalTerrainTex == NULL) {
+		// The base atlas must exist first so positions are assigned.
+		normDBG("NORMAL getNormal: about to build base");
+		getTerrainTexture();
+		normDBG("NORMAL getNormal: base built");
+		Int height = m_terrainTexHeight;
+		if (height <= 0) return NULL;
+		REF_PTR_RELEASE(m_normalTerrainTex);
+		char msg[128];
+		sprintf(msg, "NORMAL ctor height=%d width=%d", height, (int)TEXTURE_WIDTH);
+		normDBG(msg);
+		NormalMapTerrainTextureClass *normalTex = NULL;
+		if (!g_dbg_veh_handle) g_dbg_veh_handle = AddVectoredExceptionHandler(1, dbg_veh_handler);
+		g_dbg_av_code = 0; g_dbg_av_addr = nullptr;
+		try {
+			normalTex = MSGNEW("WorldHeightMap_getNormalTerrainTexture") NormalMapTerrainTextureClass(height);
+		}
+		catch (std::exception &e) {
+			normDBG("NORMAL ctor: EXCEPTION std::exception");
+			{
+				char msg3[128];
+				sprintf(msg3, "NORMAL what=%s", e.what());
+				normDBG(msg3);
+			}
+			normalTex = NULL;
+		}
+		catch (...) {
+			normDBG("NORMAL ctor: EXCEPTION");
+			normalTex = NULL;
+		}
+		if (g_dbg_av_code != 0) {
+			char dbgav[96];
+			sprintf(dbgav, "NORMAL AV: code=0x%08X addr=0x%p", g_dbg_av_code, g_dbg_av_addr);
+			normDBG(dbgav);
+		}
+		normDBG("NORMAL getNormal: ctor done");
+		{
+			char msg2[128];
+			sprintf(msg2, "NORMAL ptr=%08X", (unsigned)(unsigned long)normalTex);
+			normDBG(msg2);
+		}
+		m_normalTerrainTex = normalTex;
+		if (normalTex != NULL) {
+			m_normalTerrainTexHeight = normalTex->update(this);
+		} else {
+			m_normalTerrainTexHeight = 0;
+			normDBG("NORMAL SKIPPED update (NULL obj)");
+		}
+		normDBG("NORMAL getNormal: update done");
+	}
+	return m_normalTerrainTex;
+}
+
+TextureClass *WorldHeightMap::getNormalEdgeTerrainTexture(void)
+{
+	if (!m_hasNormalMap) {
+		return NULL;
+	}
+	if (m_normalEdgeTex == NULL) {
+		normDBG("NORMAL EDGE: about to build");
+		// The base atlas and alpha edge texture must exist first.
+		getTerrainTexture();
+		getEdgeTerrainTexture();
+		normDBG("NORMAL EDGE: base built");
+		Int height = m_terrainTexHeight;
+		if (height <= 0) return NULL;
+		REF_PTR_RELEASE(m_normalEdgeTex);
+		NormalMapEdgeTextureClass *edgeTex = NULL;
+		try {
+			edgeTex = MSGNEW("WorldHeightMap_getNormalEdgeTerrainTexture") NormalMapEdgeTextureClass(height);
+		}
+		catch (std::exception &e) {
+			normDBG("NORMAL EDGE ctor: EXCEPTION std::exception");
+			{
+				char msg3[128];
+				sprintf(msg3, "NORMAL EDGE what=%s", e.what());
+				normDBG(msg3);
+			}
+			edgeTex = NULL;
+		}
+		catch (...) {
+			normDBG("NORMAL EDGE ctor: EXCEPTION");
+			edgeTex = NULL;
+		}
+		normDBG("NORMAL EDGE: ctor done");
+		{
+			char msg2[128];
+			sprintf(msg2, "NORMAL EDGE ptr=%08X", (unsigned)(unsigned long)edgeTex);
+			normDBG(msg2);
+		}
+		m_normalEdgeTex = edgeTex;
+		if (edgeTex != NULL) {
+			m_normalEdgeHeight = edgeTex->update(this);
+		} else {
+			m_normalEdgeHeight = 0;
+			normDBG("NORMAL EDGE SKIPPED update (NULL obj)");
+		}
+		normDBG("NORMAL EDGE: update done");
+	}
+	return m_normalEdgeTex;
 }
 
 TerrainTextureClass *WorldHeightMap::getFlatTexture(Int xCell, Int yCell, Int cellWidth, Int pixelsPerCell)

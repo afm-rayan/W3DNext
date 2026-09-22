@@ -67,7 +67,12 @@ namespace
 void D3D11_Log_Line(const char * line)
 {
 	const char * path = W3DNext_GetEnv("D3D11_LOG");
-	FILE * f = std::fopen(path != nullptr ? path : "d3d11_backend.log", "a");
+	// Diagnostics are opt-in. The implicit default file caused End_Scene's
+	// per-frame statistics to open, write, flush and close a file every frame.
+	if (path == nullptr || path[0] == '\0') {
+		return;
+	}
+	FILE * f = std::fopen(path, "a");
 	if (f != nullptr) {
 		std::fputs(line, f);
 		std::fputc('\n', f);
@@ -90,6 +95,27 @@ void D3D11_Trace_Once(const char * name, const char * note)
 		D3D11_Log_Line(buf);
 	}
 }
+}
+
+// Gates the per-draw/per-texture-bind/per-upload QueryPerformanceCounter
+// instrumentation (m_dbgApplyMs, m_dbgConstMs, m_dbgSetTexMs, m_dbgUploadMs,
+// etc.). Those timers only ever get READ once a frame in End_Scene's stats
+// line, and that line is itself only written when D3D11_LOG is set - so for
+// everyone NOT actively debugging, every one of those QueryPerformanceCounter
+// calls was pure overhead, and it scales with draw-call count: a busy battle
+// with hundreds of units can issue thousands of draws + texture binds a
+// frame, i.e. tens of thousands of QPC calls purely to fill in numbers nobody
+// reads. Checked once (lazy static), so the disabled (default) path costs a
+// single already-resolved branch per call site - no getenv, no QPC. Declared
+// in D3D11Backend.h (not static) so D3D11Backend_W3D.cpp's Set_Texture can
+// use the same gate.
+bool Profiling_Enabled()
+{
+	static const bool s_enabled = [] {
+		const char * e = W3DNext_GetEnv("D3D11_PROFILE");
+		return e != nullptr && e[0] == '1';
+	}();
+	return s_enabled;
 }
 
 // Stub marker (see file header): now traces the enclosing method name once when
@@ -175,11 +201,36 @@ D3D11Backend::D3D11Backend()
 	, m_initResult(S_OK)
 	, m_deviceRemoved(false)
 	, m_vertexBuffer(nullptr)
+	, m_vertexFVF(0u)
+	, m_unitNormalFVF(0xFFFFFFFFu)  // sentinel: not yet captured
 	, m_indexBuffer(nullptr)
 	, m_constantBuffer(nullptr)
-	, m_inputLayout(nullptr)
 	, m_vertexShader(nullptr)
 	, m_pixelShader(nullptr)
+	, m_terrainNormalPixelShader(nullptr)
+	, m_terrainNormalBlendPixelShader(nullptr)
+	, m_terrainBuffer(nullptr)
+	, m_terrainNormalIsActive(false)
+	, m_gradePixelShader(nullptr)
+	, m_gradeVertexShader(nullptr)
+	, m_gradeBuffer(nullptr)
+	, m_gradeTexture(nullptr)
+	, m_gradeSRV(nullptr)
+	, m_gradeSampler(nullptr)
+	, m_gradeWidth(0)
+	, m_gradeHeight(0)
+	, m_gradeEnabled(false)
+	, m_gradeNightVision(false)
+	, m_sunScreen{ 0.5f, 0.5f, 0.0f }
+	, m_lastStencilRef(0)
+	, m_unitNormalVertexShader(nullptr)
+	, m_unitNormalPixelShader(nullptr)
+	, m_unitBuffer(nullptr)
+	, m_unitNormalIsActive(false)
+	, m_unitLastDetail(0.0f)
+	, m_unitLastSecondary(0.0f)
+	, m_waterPixelShader(nullptr)
+	, m_waterBuffer(nullptr)
 	, m_rasterizerState(nullptr)
 	, m_vsBytecode(nullptr)
 	, m_vsBytecodeSize(0)
@@ -208,6 +259,24 @@ D3D11Backend::D3D11Backend()
 	, m_fogEnable(false)
 	, m_lightEnvironment(nullptr)
 	, m_texCacheHits(0)
+	, m_frameDrawCalls(0)
+	, m_frameStartT()
+	, m_dbgApplyMs(0.0)
+	, m_dbgConstMs(0.0)
+	, m_dbgOtherMs(0.0)
+	, m_dbgDrawMs(0.0)
+	, m_dbgSetTexMs(0.0)
+	, m_dbgUploadMs(0.0)
+	, m_dbgUploads(0)
+	, m_dynVB(nullptr)
+	, m_dynVBOffset(0)
+	, m_dynVBCap(0)
+	, m_dynIB(nullptr)
+	, m_dynIBOffset(0)
+	, m_dynIBCap(0)
+	, m_lastBlendState(nullptr)
+	, m_lastDepthState(nullptr)
+	, m_lastRasterState(nullptr)
 	, m_texCacheUploads(0)
 	, m_texCacheEvictions(0)
 	, m_flipFrame(0)
@@ -220,13 +289,18 @@ D3D11Backend::D3D11Backend()
 	, m_activeBlendState(nullptr)
 	, m_activeDepthState(nullptr)
 	, m_activeRasterizerState(nullptr)
+	, m_savedBackBufferRTV(nullptr)
+	, m_currentRTV(nullptr)
+	, m_currentDSV(nullptr)
 {
+	QueryPerformanceFrequency(&m_qpcFreq);
 	m_lastShaderBits = 0;
 	for (int i = 0; i < RB_MAX_TEXTURE_STAGES; ++i) {
 		m_stageTexture[i] = nullptr;
 		m_stageSRV[i] = nullptr;
 		m_stageSampler[i] = nullptr;
 		m_boundTextures[i] = nullptr;
+		m_boundTexGen[i] = 0;
 		m_stageNeutral[i] = false;
 		m_stageTexFormatLog[i] = 0;
 	}
@@ -341,15 +415,17 @@ void D3D11Backend::Initialize(void * window, int width, int height)
 	scd.Windowed = TRUE;
 	scd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
 
-	// W3DNEXT_D3D11_FLIP=1: flip-model swapchain instead of the legacy single-
-	// buffered blt DISCARD above. Motivation (2026-07-26, gpuprof): with the
-	// blt model ~85% of the D3D11 frame's wall time sits INSIDE Present
-	// (~41-52ms of a 48-60ms frame at 2560x1440 windowed) - a single-buffered
-	// blt present serializes against DWM composition. Env-toggled so the A/B
-	// is one binary flipped at launch, per the parity log's standing rule.
+	// Flip-model swapchain (default ON since 2026-08-20): the legacy single-
+	// buffered blt DISCARD below serializes Present against DWM composition -
+	// measured (gpuprof, 2026-07-26): ~85% of the D3D11 frame's wall time sits
+	// INSIDE Present (~41-52ms of a 48-60ms frame at 2560x1440 windowed). That
+	// makes the whole port feel GPU-bound at ~10-15 FPS even on trivial scenes.
+	// Flip-discard + 2 buffers removes the DWM stall; it was env-gated
+	// (W3DNEXT_D3D11_FLIP=1) for A/B parity testing and is now the default.
+	// W3DNEXT_D3D11_FLIP=0 keeps the legacy blt path.
 	{
 		const char * e = W3DNext_GetEnv("D3D11_FLIP");
-		m_flipModel = (e != nullptr && e[0] == '1');
+		m_flipModel = (e == nullptr || e[0] == '\0' || e[0] != '0');
 		if (m_flipModel) {
 			scd.BufferCount = 2;   // flip model requires >= 2 buffers
 			scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
@@ -442,6 +518,8 @@ void D3D11Backend::Bind_Back_Buffer_Targets()
 	}
 
 	m_context->OMSetRenderTargets(1, &m_backBufferRTV, m_depthStencilView);
+	m_currentRTV = m_backBufferRTV;
+	m_currentDSV = m_depthStencilView;
 
 	D3D11_VIEWPORT vp;
 	vp.TopLeftX = 0.0f;
@@ -481,6 +559,19 @@ void D3D11Backend::Release_Device_Objects()
 	Safe_Release(m_captureSampler);
 	Safe_Release(m_captureSRV);
 	Safe_Release(m_captureTexture);
+	for (auto & kv : m_rtt) {
+		RTTTarget & t = kv.second;
+		Safe_Release(t.sampler);
+		Safe_Release(t.dsv);
+		Safe_Release(t.depthTex);
+		Safe_Release(t.srv);
+		Safe_Release(t.rtv);
+		Safe_Release(t.tex);
+	}
+	m_rtt.clear();
+	m_savedBackBufferRTV = nullptr;
+	m_currentRTV = nullptr;
+	m_currentDSV = nullptr;
 	Safe_Release(m_depthStencilView);
 	Safe_Release(m_depthStencilTexture);
 	Safe_Release(m_backBufferRTV);
@@ -555,6 +646,198 @@ bool D3D11Backend::Create_Pipeline_Resources()
 	}
 	Safe_Release(ps_blob);
 	Safe_Release(vs_blob);
+
+	// --- Terrain normal-mapping pixel shader (clean D3D11 path) --------------
+	// Compiled from kTerrainNormalPixelShaderHLSL. Failure is non-fatal: the
+	// terrain normal path simply stays inert and the FF combiner keeps driving
+	// terrain (the same behaviour as the DX8 token path, which this backend
+	// stubs). The game-side terrain normal feature enables it explicitly.
+	ID3DBlob * tps_blob = nullptr;
+	ID3DBlob * tps_err = nullptr;
+	HRESULT tps_hr = D3DCompile(
+		kTerrainNormalPixelShaderHLSL, std::strlen(kTerrainNormalPixelShaderHLSL),
+		"TerrainNormalPixel.hlsl", nullptr, nullptr,
+		// ps_4_1: CalculateLevelOfDetail (used to mip-match the blend-edge
+		// neighbour samples) requires shader model 4.1; every FL10.1+ GPU has it.
+		"main", "ps_4_1", compile_flags, 0, &tps_blob, &tps_err);
+	if (FAILED(tps_hr) && tps_err != nullptr) {
+		// Silent failure here kills terrain relief AND the god-ray sun feed.
+		D3D11_Log_Line("[D3D11] TerrainNormal ps_4_1 compile FAILED:");
+		D3D11_Log_Line(static_cast<const char *>(tps_err->GetBufferPointer()));
+	}
+	Safe_Release(tps_err);
+	if (SUCCEEDED(tps_hr)) {
+		tps_hr = m_device->CreatePixelShader(
+			tps_blob->GetBufferPointer(), tps_blob->GetBufferSize(), nullptr, &m_terrainNormalPixelShader);
+	}
+	Safe_Release(tps_blob);
+	if (FAILED(tps_hr)) {
+		m_terrainNormalPixelShader = nullptr;
+	}
+
+	// --- Terrain normal-mapping BLEND (edge crossfade) pixel shader ---------
+	// Compiled from kTerrainNormalBlendPixelShaderHLSL. Same as the normal
+	// terrain shader but crossfades the normal (and base colour) across texture
+	// boundaries and outputs the per-vertex blend weight as alpha. Used by the
+	// separate renderNormalEdgeBlend() pass.
+	ID3DBlob * tpsb_blob = nullptr;
+	ID3DBlob * tpsb_err = nullptr;
+	HRESULT tpsb_hr = D3DCompile(
+		kTerrainNormalBlendPixelShaderHLSL, std::strlen(kTerrainNormalBlendPixelShaderHLSL),
+		"TerrainNormalBlendPixel.hlsl", nullptr, nullptr,
+		"main", "ps_4_0", compile_flags, 0, &tpsb_blob, &tpsb_err);
+	Safe_Release(tpsb_err);
+	if (SUCCEEDED(tpsb_hr)) {
+		tpsb_hr = m_device->CreatePixelShader(
+			tpsb_blob->GetBufferPointer(), tpsb_blob->GetBufferSize(), nullptr, &m_terrainNormalBlendPixelShader);
+	}
+	Safe_Release(tpsb_blob);
+	if (FAILED(tpsb_hr)) {
+		m_terrainNormalBlendPixelShader = nullptr;
+	}
+
+	// --- W3DNext color-grading post-process ----------------------------------
+	// Full-screen pass run at End_Frame before Present. Non-fatal on failure.
+	// ON by default; W3DNEXT_GRADE=0 disables entirely. The '5' key toggles it
+	// live at runtime for instant A/B comparison (edge-detected).
+	{
+		const char * ge = W3DNext_GetEnv("W3DNEXT_GRADE");
+		m_gradeEnabled = !(ge != nullptr && ge[0] == '0');
+		ID3DBlob * gvs_blob = nullptr;
+		ID3DBlob * gps_blob = nullptr;
+		ID3DBlob * g_err = nullptr;
+		HRESULT g_hr = D3DCompile(
+			kColorGradeVertexShaderHLSL, std::strlen(kColorGradeVertexShaderHLSL),
+			"ColorGradeVertex.hlsl", nullptr, nullptr,
+			"main", "vs_4_0", compile_flags, 0, &gvs_blob, &g_err);
+		Safe_Release(g_err);
+		if (SUCCEEDED(g_hr)) {
+			g_hr = m_device->CreateVertexShader(
+				gvs_blob->GetBufferPointer(), gvs_blob->GetBufferSize(), nullptr, &m_gradeVertexShader);
+		}
+		Safe_Release(gvs_blob);
+		g_hr = D3DCompile(
+			kColorGradePixelShaderHLSL, std::strlen(kColorGradePixelShaderHLSL),
+			"ColorGradePixel.hlsl", nullptr, nullptr,
+			"main", "ps_4_0", compile_flags, 0, &gps_blob, &g_err);
+		if (FAILED(g_hr) && g_err != nullptr) {
+			// Surface HLSL compile errors - a silent failure here kills the
+			// whole grade pass (no grading, no NV, no god rays).
+			D3D11_Log_Line("[D3D11] ColorGradePixel compile FAILED:");
+			D3D11_Log_Line(static_cast<const char *>(g_err->GetBufferPointer()));
+		}
+		Safe_Release(g_err);
+		if (SUCCEEDED(g_hr)) {
+			g_hr = m_device->CreatePixelShader(
+				gps_blob->GetBufferPointer(), gps_blob->GetBufferSize(), nullptr, &m_gradePixelShader);
+		}
+		Safe_Release(gps_blob);
+		if (FAILED(g_hr)) {
+			m_gradePixelShader = nullptr;
+			m_gradeVertexShader = nullptr;
+		}
+		D3D11_BUFFER_DESC gcbd;
+		ZeroMemory(&gcbd, sizeof(gcbd));
+		gcbd.ByteWidth = sizeof(float) * 20; // 80 bytes (5 vec4), a 16-byte multiple
+		gcbd.Usage = D3D11_USAGE_DEFAULT;
+		gcbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		if (FAILED(m_device->CreateBuffer(&gcbd, nullptr, &m_gradeBuffer))) {
+			m_gradeBuffer = nullptr;
+			m_gradeEnabled = false;
+		}
+		D3D11_SAMPLER_DESC gsd;
+		ZeroMemory(&gsd, sizeof(gsd));
+		gsd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+		gsd.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+		gsd.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+		gsd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+		gsd.MaxAnisotropy = 1;
+		gsd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+		gsd.MinLOD = 0.0f;
+		gsd.MaxLOD = D3D11_FLOAT32_MAX;
+		if (FAILED(m_device->CreateSamplerState(&gsd, &m_gradeSampler))) {
+			m_gradeSampler = nullptr;
+			m_gradeEnabled = false;
+		}
+	}
+
+	// --- Unit/model normal-mapping shaders (clean D3D11 path) ----------------
+	// Compiled from kUnitNormalVertexShaderHLSL + kUnitNormalPixelShaderHLSL.
+	// Failure is non-fatal: the unit normal path stays inert and the FF combiner
+	// keeps driving units (the same graceful fallback as the terrain normal
+	// path). The game-side unit normal feature enables it per mesh explicitly.
+	ID3DBlob * unvs_blob = nullptr;
+	ID3DBlob * unvs_err = nullptr;
+	HRESULT unvs_hr = D3DCompile(
+		kUnitNormalVertexShaderHLSL, std::strlen(kUnitNormalVertexShaderHLSL),
+		"UnitNormalVertex.hlsl", nullptr, nullptr,
+		"main", "vs_4_0", compile_flags, 0, &unvs_blob, &unvs_err);
+	if (FAILED(unvs_hr)) {
+		if (unvs_err != nullptr) {
+			const char * msg = (const char *)unvs_err->GetBufferPointer();
+			FILE * dbg = fopen("unitnorm.log", "a");
+			if (dbg) { fprintf(dbg, "UNIT_VS_COMPILE_ERROR: %s\n", msg); fclose(dbg); }
+		}
+		Safe_Release(unvs_err);
+		m_unitNormalVertexShader = nullptr;
+	} else {
+		unvs_hr = m_device->CreateVertexShader(
+			unvs_blob->GetBufferPointer(), unvs_blob->GetBufferSize(), nullptr, &m_unitNormalVertexShader);
+		if (FAILED(unvs_hr)) {
+			m_unitNormalVertexShader = nullptr;
+		}
+		Safe_Release(unvs_blob);
+	}
+	ID3DBlob * unps_blob = nullptr;
+	ID3DBlob * unps_err = nullptr;
+	HRESULT unps_hr = D3DCompile(
+		kUnitNormalPixelShaderHLSL, std::strlen(kUnitNormalPixelShaderHLSL),
+		"UnitNormalPixel.hlsl", nullptr, nullptr,
+		"main", "ps_4_0", compile_flags, 0, &unps_blob, &unps_err);
+	if (FAILED(unps_hr) && unps_err != nullptr) {
+		const char * msg = (const char *)unps_err->GetBufferPointer();
+		FILE * dbg = fopen("unitnorm.log", "a");
+		if (dbg) { fprintf(dbg, "UNIT_PS_COMPILE_ERROR: %s\n", msg); fclose(dbg); }
+	}
+	Safe_Release(unps_err);
+	if (SUCCEEDED(unps_hr)) {
+		unps_hr = m_device->CreatePixelShader(
+			unps_blob->GetBufferPointer(), unps_blob->GetBufferSize(), nullptr, &m_unitNormalPixelShader);
+	}
+	Safe_Release(unps_blob);
+	if (FAILED(unps_hr)) {
+		m_unitNormalPixelShader = nullptr;
+	}
+	{
+		FILE * dbg = fopen("unitnorm.log", "a");
+		if (dbg) { fprintf(dbg, "UNIT_SHADER_STATUS VS=%d PS=%d\n",
+			m_unitNormalVertexShader ? 1 : 0, m_unitNormalPixelShader ? 1 : 0); fclose(dbg); }
+	}
+	// --- Water reflection/surface pixel shader (clean D3D11 path) -------------
+	// Compiled from kWaterPixelShaderHLSL (sun glint + planar reflection).
+	// Non-fatal: on failure m_waterPixelShader stays null and W3DWater.cpp leaves
+	// the FF combiner active for water, so water stays flat-but-visible (matching the
+	// terrain/unit normal shader fallback).
+	ID3DBlob * wps_blob = nullptr;
+	ID3DBlob * wps_err = nullptr;
+	HRESULT wps_hr = D3DCompile(
+		kWaterPixelShaderHLSL, std::strlen(kWaterPixelShaderHLSL),
+		"WaterPixel.hlsl", nullptr, nullptr,
+		"main", "ps_4_0", compile_flags, 0, &wps_blob, &wps_err);
+	Safe_Release(wps_err);
+	if (SUCCEEDED(wps_hr)) {
+		wps_hr = m_device->CreatePixelShader(
+			wps_blob->GetBufferPointer(), wps_blob->GetBufferSize(), nullptr, &m_waterPixelShader);
+	}
+	Safe_Release(wps_blob);
+	if (FAILED(wps_hr)) {
+		m_waterPixelShader = nullptr;
+	}
+	{
+		FILE * dbg = fopen("water.log", "a");
+		if (dbg) { fprintf(dbg, "WATER_SHADER_STATUS compile=%d create=%d PS=%d buffer=%d\n", (int)wps_hr, (m_waterPixelShader ? 1 : 0), (m_waterPixelShader ? 1 : 0), (m_waterBuffer ? 1 : 0)); fclose(dbg); }
+	}
+
 	if (m_vsBytecode == nullptr) {
 		return false;
 	}
@@ -632,6 +915,54 @@ bool D3D11Backend::Create_Pipeline_Resources()
 		return false;
 	}
 
+	// --- Terrain normal constant buffer (cbTerrain, pixel-shader register b0) -
+	// Carries sun direction, sun color, ambient and flags to the terrain HLSL
+	// shader. Non-fatal: if it fails the terrain normal path is disabled.
+	D3D11_BUFFER_DESC tcbd;
+	ZeroMemory(&tcbd, sizeof(tcbd));
+	tcbd.ByteWidth = sizeof(float) * 16; // 64 bytes, a 16-byte multiple
+	tcbd.Usage = D3D11_USAGE_DEFAULT;
+	tcbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+	hr = m_device->CreateBuffer(&tcbd, nullptr, &m_terrainBuffer);
+	if (FAILED(hr)) {
+		m_terrainBuffer = nullptr;
+		m_terrainNormalPixelShader = nullptr;
+	}
+
+	// --- Unit normal constant buffer (cbUnit, pixel-shader register b0) ------
+	// Carries sun direction/color, ambient, camera position and Blinn-Phong
+	// params to the unit HLSL shader. Non-fatal: if it fails the unit normal
+	// path is disabled and units fall back to the FF pipeline.
+	D3D11_BUFFER_DESC ucbd;
+	ZeroMemory(&ucbd, sizeof(ucbd));
+	ucbd.ByteWidth = sizeof(float) * 16 * 8; // 128 bytes (8 vec4), a 16-byte multiple
+	ucbd.Usage = D3D11_USAGE_DEFAULT;
+	ucbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+	hr = m_device->CreateBuffer(&ucbd, nullptr, &m_unitBuffer);
+	if (FAILED(hr)) {
+		m_unitBuffer = nullptr;
+		m_unitNormalVertexShader = nullptr;
+		m_unitNormalPixelShader = nullptr;
+	}
+
+	// --- Water constant buffer (cbWater, pixel-shader register b0) ------------
+	// Carries sun direction/color, wave bump strength, reflection factor, sun
+	// glitter and a time value to kWaterPixelShaderHLSL. Mirrors the unit buffer
+	// (which over-allocates); non-fatal - on failure water falls back to the FF
+	// combiner (flat, but visible).
+	{
+		D3D11_BUFFER_DESC wcbd;
+		ZeroMemory(&wcbd, sizeof(wcbd));
+		wcbd.ByteWidth = sizeof(float) * 16 * 4; // 256 bytes (Params, ViewportSize, SunDir, SunColor)
+		wcbd.Usage = D3D11_USAGE_DEFAULT;
+		wcbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		hr = m_device->CreateBuffer(&wcbd, nullptr, &m_waterBuffer);
+		if (FAILED(hr)) {
+			m_waterBuffer = nullptr;
+			m_waterPixelShader = nullptr;
+		}
+	}
+
 	// --- No-cull solid rasterizer (skeleton draws either winding) -----------
 	D3D11_RASTERIZER_DESC rsd;
 	ZeroMemory(&rsd, sizeof(rsd));
@@ -699,11 +1030,34 @@ void D3D11Backend::Release_Pipeline_Resources()
 	Safe_Release(m_lightingBuffer);
 	Safe_Release(m_combinerBuffer);
 	Safe_Release(m_rasterizerState);
-	Safe_Release(m_inputLayout);
 	Safe_Release(m_constantBuffer);
 	Safe_Release(m_indexBuffer);
 	Safe_Release(m_vertexBuffer);
+	Safe_Release(m_dynVB);
+	m_dynVBCap = 0;
+	m_dynVBOffset = 0;
+	Safe_Release(m_dynIB);
+	m_dynIBCap = 0;
+	m_dynIBOffset = 0;
+	for (auto & kv : m_inputLayoutCache) {
+		Safe_Release(kv.second);
+	}
+	m_inputLayoutCache.clear();
 	Safe_Release(m_pixelShader);
+	Safe_Release(m_terrainNormalPixelShader);
+	Safe_Release(m_terrainNormalBlendPixelShader);
+	Safe_Release(m_terrainBuffer);
+	Safe_Release(m_gradePixelShader);
+	Safe_Release(m_gradeVertexShader);
+	Safe_Release(m_gradeBuffer);
+	Safe_Release(m_gradeSRV);
+	Safe_Release(m_gradeTexture);
+	Safe_Release(m_gradeSampler);
+	Safe_Release(m_unitNormalVertexShader);
+	Safe_Release(m_unitNormalPixelShader);
+	Safe_Release(m_unitBuffer);
+	Safe_Release(m_waterPixelShader);
+	Safe_Release(m_waterBuffer);
 	Safe_Release(m_vertexShader);
 	if (m_vsBytecode != nullptr) {
 		delete[] static_cast<unsigned char *>(m_vsBytecode);
@@ -747,6 +1101,252 @@ void D3D11Backend::Update_Constant_Buffer()
 	}
 	m_context->UpdateSubresource(m_constantBuffer, 0, nullptr, &wvp, 0, 0);
 	m_transformDirty = false;
+}
+
+void D3D11Backend::Set_Terrain_Normal_Pixel_Shader(bool enable)
+{
+	m_terrainNormalIsActive = enable;
+	if (m_context == nullptr) {
+		return;
+	}
+	// Rainbow-artifact fix: this function only ever swaps the PIXEL shader.
+	// If a unit-normal draw ran just before this (VSSetShader(m_unitNormalVertexShader)
+	// + m_unitNormalIsActive=true), leaving unit-normal mode "on" while we bind the
+	// terrain/FF pixel shader here desyncs the VS/PS pair: the VS still outputs
+	// worldPos/worldNormal in TEXCOORD0/1, but the newly bound PS reads TEXCOORD0
+	// as a UV -> texture sampled at world-space coordinates -> chaotic per-pixel
+	// colours ("rainbow"). Force the unit-normal pair fully off first (no-op if
+	// it wasn't active) so VS and PS are always a matched pair.
+	Set_Unit_Normal_Pixel_Shader(false, 0.0f, 0.0f);
+	if (enable && m_terrainNormalPixelShader != nullptr) {
+		m_context->PSSetShader(m_terrainNormalPixelShader, nullptr, 0);
+		m_context->PSSetConstantBuffers(0, 1, &m_terrainBuffer);
+		m_context->PSSetConstantBuffers(1, 1, &m_fogBuffer);
+	} else {
+		// Restore the FF combiner pipeline (mirrors the Create_Pipeline_Resources bind).
+		m_context->PSSetShader(m_pixelShader, nullptr, 0);
+		m_context->PSSetConstantBuffers(0, 1, &m_combinerBuffer);
+		m_context->PSSetConstantBuffers(1, 1, &m_fogBuffer);
+		m_context->PSSetConstantBuffers(2, 1, &m_texgenBuffer);
+	}
+}
+
+void D3D11Backend::Set_Terrain_Normal_Blend_Pixel_Shader(bool enable)
+{
+	m_terrainNormalIsActive = enable;
+	if (m_context == nullptr) {
+		return;
+	}
+	// Same VS/PS desync fix as Set_Terrain_Normal_Pixel_Shader above - see the
+	// comment there. This path binds a different terrain PS but has the exact
+	// same "PS-only swap while unit-normal VS is still bound" hazard.
+	Set_Unit_Normal_Pixel_Shader(false, 0.0f, 0.0f);
+	if (enable && m_terrainNormalBlendPixelShader != nullptr) {
+		m_context->PSSetShader(m_terrainNormalBlendPixelShader, nullptr, 0);
+		m_context->PSSetConstantBuffers(0, 1, &m_terrainBuffer);
+		m_context->PSSetConstantBuffers(1, 1, &m_fogBuffer);
+	} else {
+		// Restore the FF combiner pipeline.
+		m_context->PSSetShader(m_pixelShader, nullptr, 0);
+		m_context->PSSetConstantBuffers(0, 1, &m_combinerBuffer);
+		m_context->PSSetConstantBuffers(1, 1, &m_fogBuffer);
+		m_context->PSSetConstantBuffers(2, 1, &m_texgenBuffer);
+	}
+}
+
+void D3D11Backend::Set_Terrain_Normal_Constants(const Vector3 & sunDir, const Vector3 & sunColor,
+                                                const Vector3 & ambient, bool useLightMap)
+{
+	if (m_context == nullptr || m_terrainBuffer == nullptr) {
+		return;
+	}
+	struct TerrainConstants { float SunDir[4]; float SunColor[4]; float Ambient[4]; float Params[4]; };
+	TerrainConstants tc;
+	tc.SunDir[0] = sunDir.X;   tc.SunDir[1] = sunDir.Y;   tc.SunDir[2] = sunDir.Z;   tc.SunDir[3] = 0.0f;
+	tc.SunColor[0] = sunColor.X; tc.SunColor[1] = sunColor.Y; tc.SunColor[2] = sunColor.Z; tc.SunColor[3] = 1.0f;
+	tc.Ambient[0] = ambient.X;  tc.Ambient[1] = ambient.Y;  tc.Ambient[2] = ambient.Z;  tc.Ambient[3] = 1.0f;
+	tc.Params[0] = useLightMap ? 1.0f : 0.0f;
+	// TerrainParams.y/z/w drive the enhanced terrain look (specular sun glint +
+	// micro-shadow). Kept here so they can be tuned without touching the HLSL.
+	static const float kSpecStrength = 0.55f;   // y: overall glint intensity
+	static const float kMicroShadow  = 0.45f;   // z: crevice darkening strength
+	static const float kSpecShininess = 56.0f;  // w: glint softness (higher = wider, calmer sheen)
+	tc.Params[1] = kSpecStrength; tc.Params[2] = kMicroShadow; tc.Params[3] = kSpecShininess;
+	m_context->UpdateSubresource(m_terrainBuffer, 0, nullptr, &tc, 0, 0);
+}
+
+void D3D11Backend::Set_Unit_Normal_Pixel_Shader(bool enable, float detailStrength, float secondaryAdd)
+{
+	if (m_context == nullptr) {
+		return;
+	}
+	if (enable && m_unitNormalVertexShader != nullptr && m_unitNormalPixelShader != nullptr) {
+		// Only perform the (relatively expensive) VS/PS pipeline switch when
+		// transitioning INTO unit-normal mode. Consecutive unit categories therefore
+		// share one switch per frame instead of thrashing VS/PS state. The constant
+		// buffer (sun/ambient/alpha-test) IS refreshed on every enabling call so each
+		// unit category gets its own up-to-date alpha-test state.
+		if (!m_unitNormalIsActive) {
+			m_context->VSSetShader(m_unitNormalVertexShader, nullptr, 0);
+			m_context->PSSetShader(m_unitNormalPixelShader, nullptr, 0);
+			m_context->VSSetConstantBuffers(0, 1, &m_constantBuffer);
+			m_context->VSSetConstantBuffers(1, 1, &m_lightingBuffer);
+			m_context->VSSetConstantBuffers(2, 1, &m_skinningBuffer);
+			m_context->VSSetConstantBuffers(3, 1, &m_texgenBuffer);
+			m_context->PSSetConstantBuffers(0, 1, &m_unitBuffer);
+			m_context->PSSetConstantBuffers(1, 1, &m_fogBuffer);
+		}
+		// Derive sun direction / color / ambient from the configured FF lighting
+		// (the same source that currently lights units), so the unit normal path
+		// is consistent with the rest of the scene. Camera position is taken from
+		// the view matrix inside Set_Unit_Normal_Constants.
+		Vector3 sunDir(-m_lighting.lightDir[0][0], -m_lighting.lightDir[0][1], -m_lighting.lightDir[0][2]);
+		float sunLen = sunDir.X * sunDir.X + sunDir.Y * sunDir.Y + sunDir.Z * sunDir.Z;
+		if (sunLen < 1e-6f) { sunDir.Set(0.5f, -0.8f, 0.3f); }
+		sunDir.Normalize();
+		Vector3 sunColor(m_lighting.lightDiffuse[0][0], m_lighting.lightDiffuse[0][1], m_lighting.lightDiffuse[0][2]);
+		float sunColLen = sunColor.X * sunColor.X + sunColor.Y * sunColor.Y + sunColor.Z * sunColor.Z;
+		if (sunColLen < 1e-6f) { sunColor.Set(1.0f, 1.0f, 1.0f); }
+		Vector3 ambient(m_lighting.globalAmbient[0], m_lighting.globalAmbient[1], m_lighting.globalAmbient[2]);
+		float ambLen = ambient.X * ambient.X + ambient.Y * ambient.Y + ambient.Z * ambient.Z;
+		if (ambLen < 1e-6f) { ambient.Set(0.3f, 0.3f, 0.3f); }
+
+		Set_Unit_Normal_Constants(sunDir, sunColor, ambient, detailStrength, secondaryAdd);
+		m_unitNormalIsActive = true;
+		// Mark the captured unit-normal FVF as "not yet known". The first Draw_Triangles
+		// while active captures the real FVF; any later draw with a different FVF
+		// (shadow/decal quads that inherited the bound pipeline) is force-reset.
+		m_unitNormalFVF = 0xFFFFFFFFu;
+	} else {
+		// Restore the FF combiner pipeline (mirrors the Create_Pipeline_Resources bind).
+		// Guarded so non-unit categories between unit groups do not re-thrash state.
+		if (m_unitNormalIsActive) {
+			m_context->VSSetShader(m_vertexShader, nullptr, 0);
+			m_context->PSSetShader(m_pixelShader, nullptr, 0);
+			m_context->VSSetConstantBuffers(0, 1, &m_constantBuffer);
+			m_context->VSSetConstantBuffers(1, 1, &m_lightingBuffer);
+			m_context->VSSetConstantBuffers(2, 1, &m_skinningBuffer);
+			m_context->VSSetConstantBuffers(3, 1, &m_texgenBuffer);
+			m_context->PSSetConstantBuffers(0, 1, &m_combinerBuffer);
+			m_context->PSSetConstantBuffers(1, 1, &m_fogBuffer);
+			m_context->PSSetConstantBuffers(2, 1, &m_texgenBuffer);
+			m_unitNormalIsActive = false;
+			m_unitNormalFVF = 0u;
+		}
+	}
+}
+
+void D3D11Backend::Set_Unit_Normal_Constants(const Vector3 & sunDir, const Vector3 & sunColor,
+                                             const Vector3 & ambient, float detailStrength, float secondaryAdd)
+{
+	if (m_context == nullptr || m_unitBuffer == nullptr) {
+		return;
+	}
+	// Derive the camera world position from the current view matrix
+	// (world->view). For V = R * w + t with t = V(0), the camera position c
+	// satisfies V(c) = 0 => c = -R^T * t. WWMath stores the matrix row-major.
+	float * v = reinterpret_cast<float *>(&m_view);
+	float tx = v[12], ty = v[13], tz = v[14];
+	float camX = -(v[0] * tx + v[1] * ty + v[2] * tz);
+	float camY = -(v[4] * tx + v[5] * ty + v[6] * tz);
+	float camZ = -(v[8] * tx + v[9] * ty + v[10] * tz);
+	struct UnitConstants {
+		float SunDir[4]; float SunColor[4]; float AmbientColor[4]; float CameraPos[4];
+		float SpecularColor[4]; float Params[4]; float MatTint[4]; float Params2[4];
+		float Alpha[4];  // x=enable, y=lessEqual, z=ref (mirrors DX8 alpha test)
+	};
+	UnitConstants uc;
+	uc.SunDir[0] = sunDir.X; uc.SunDir[1] = sunDir.Y; uc.SunDir[2] = sunDir.Z; uc.SunDir[3] = 0.0f;
+	uc.SunColor[0] = sunColor.X; uc.SunColor[1] = sunColor.Y; uc.SunColor[2] = sunColor.Z; uc.SunColor[3] = 1.0f;
+	uc.AmbientColor[0] = ambient.X; uc.AmbientColor[1] = ambient.Y; uc.AmbientColor[2] = ambient.Z; uc.AmbientColor[3] = 1.0f;
+	uc.CameraPos[0] = camX; uc.CameraPos[1] = camY; uc.CameraPos[2] = camZ; uc.CameraPos[3] = 1.0f;
+	uc.SpecularColor[0] = 1.0f; uc.SpecularColor[1] = 1.0f; uc.SpecularColor[2] = 1.0f; uc.SpecularColor[3] = 1.0f;
+	uc.Params[0] = 32.0f;  // specular power (shininess)
+	uc.Params[1] = 1.0f;   // normal intensity (full perturbation)
+	uc.Params[2] = 1.0f;   // enable specular
+	uc.Params[3] = 1.0f;   // enable normal map (caller binds it to t2)
+	uc.MatTint[0] = 1.0f; uc.MatTint[1] = 1.0f; uc.MatTint[2] = 1.0f; uc.MatTint[3] = 1.0f;
+	uc.Params2[0] = detailStrength;  // post-detail multiplicative strength (0 = off)
+	uc.Params2[1] = secondaryAdd;    // secondary gradient (team color) add enable
+	uc.Params2[2] = 0.0f; uc.Params2[3] = 0.0f;
+	m_unitLastDetail = detailStrength;
+	m_unitLastSecondary = secondaryAdd;
+	// Mirror the current DX8 alpha-test state so the unit-normal pixel shader can
+	// discard cutout texels exactly like the FF combiner (fixes transparent fences
+	// and other alpha-tested geometry showing solid under the normal pipeline).
+	uc.Alpha[0] = (float)m_combiner.alphaTestEnable;
+	uc.Alpha[1] = (float)m_combiner.alphaTestLessEqual;
+	uc.Alpha[2] = m_combiner.alphaTestRef;
+	uc.Alpha[3] = 0.0f;
+	// W3DNext: avoid re-uploading the unit-normal constant buffer every time this
+	// is called (once per unit category per frame -> a GPU upload stall that tanks
+	// FPS). Only push to the GPU when the contents actually changed.
+	static UnitConstants s_lastUnit;
+	static bool s_unitInit = false;
+	if (s_unitInit && std::memcmp(&uc, &s_lastUnit, sizeof(UnitConstants)) == 0) {
+		return;
+	}
+	s_lastUnit = uc;
+	s_unitInit = true;
+	m_context->UpdateSubresource(m_unitBuffer, 0, nullptr, &uc, 0, 0);
+}
+
+void D3D11Backend::Set_Water_Pixel_Shader(bool enable)
+{
+	if (m_context == nullptr) {
+		return;
+	}
+	// Same VS/PS desync fix as Set_Terrain_Normal_Pixel_Shader - see the comment
+	// there. Water draws use the FF vertex shader, so if a unit-normal draw ran
+	// immediately before and left m_unitNormalIsActive true, this PS-only swap
+	// would leave the unit-normal VS bound underneath the water PS.
+	Set_Unit_Normal_Pixel_Shader(false, 0.0f, 0.0f);
+	if (enable && m_waterPixelShader != nullptr) {
+		// Activate the water reflection/surface pixel shader. cbWater is bound at b3
+		// (NOT b0): Draw_Triangles internally re-uploads the WVP/combiner buffers to
+		// b0/b1/b2 for EVERY draw, so binding cbWater at b0 would be clobbered right
+		// before the water tile draws -> all-zero Params -> flat reflection. b3 is
+		// untouched by the FF constant updates, so the water params survive.
+		m_context->PSSetShader(m_waterPixelShader, nullptr, 0);
+		m_context->PSSetConstantBuffers(3, 1, &m_waterBuffer);
+		m_context->PSSetConstantBuffers(1, 1, &m_fogBuffer);
+		m_context->PSSetConstantBuffers(2, 1, &m_texgenBuffer);
+	} else {
+		// Restore the FF combiner pipeline so the next (non-water) draw - including the
+		// post-water shroud pass - samples its own textures with the FF PS.
+		m_context->PSSetShader(m_pixelShader, nullptr, 0);
+		m_context->PSSetConstantBuffers(0, 1, &m_combinerBuffer);
+		m_context->PSSetConstantBuffers(1, 1, &m_fogBuffer);
+		m_context->PSSetConstantBuffers(2, 1, &m_texgenBuffer);
+	}
+}
+
+void D3D11Backend::Set_Water_Constants(const Vector3 & sunDir, const Vector3 & sunColor,
+                                       float bumpScale, float reflectionFactor, float sunGlitter,
+                                       float time, unsigned viewportW, unsigned viewportH)
+{
+	if (m_context == nullptr || m_waterBuffer == nullptr) {
+		return;
+	}
+	struct WaterConstants
+	{
+		float Params[4];
+		float ViewportSize[4];
+		float SunDir[4];
+		float SunColor[4];
+	};
+	WaterConstants wc;
+	wc.Params[0] = bumpScale;
+	wc.Params[1] = reflectionFactor;
+	wc.Params[2] = sunGlitter;
+	wc.Params[3] = time;
+	wc.ViewportSize[0] = static_cast<float>(viewportW);
+	wc.ViewportSize[1] = static_cast<float>(viewportH);
+	wc.ViewportSize[2] = viewportW > 0 ? (1.0f / static_cast<float>(viewportW)) : 0.0f;
+	wc.ViewportSize[3] = viewportH > 0 ? (1.0f / static_cast<float>(viewportH)) : 0.0f;
+	wc.SunDir[0] = sunDir.X; wc.SunDir[1] = sunDir.Y; wc.SunDir[2] = sunDir.Z; wc.SunDir[3] = 0.0f;
+	wc.SunColor[0] = sunColor.X; wc.SunColor[1] = sunColor.Y; wc.SunColor[2] = sunColor.Z; wc.SunColor[3] = 1.0f;
+	m_context->UpdateSubresource(m_waterBuffer, 0, nullptr, &wc, 0, 0);
 }
 
 void D3D11Backend::Update_Combiner_Buffer()
@@ -1232,6 +1832,30 @@ void D3D11Backend::Release_Texture_Cache()
 	m_textureCache.clear();
 }
 
+void D3D11Backend::Evict_Render_Target(TextureBaseClass * tex)
+{
+	if (tex == nullptr) {
+		return;
+	}
+	auto it = m_rtt.find(tex);
+	if (it == m_rtt.end()) {
+		return;
+	}
+	RTTTarget & t = it->second;
+	// If this RT is currently bound, drop back to the backbuffer first.
+	if (m_currentRTV == t.rtv || m_savedBackBufferRTV == t.rtv) {
+		Bind_Back_Buffer_Targets();
+		m_savedBackBufferRTV = nullptr;
+	}
+	Safe_Release(t.sampler);
+	Safe_Release(t.dsv);
+	Safe_Release(t.depthTex);
+	Safe_Release(t.srv);
+	Safe_Release(t.rtv);
+	Safe_Release(t.tex);
+	m_rtt.erase(it);
+}
+
 bool D3D11Backend::Upload_Fallback_Texture(unsigned int stage)
 {
 	// 4x4 magenta/black 2x2-checker (R,G,B,A memory order): wrong-but-visible for
@@ -1255,6 +1879,18 @@ bool D3D11Backend::Bind_Neutral_Texture(unsigned int stage)
 {
 	if (m_device == nullptr || m_context == nullptr || stage >= RB_MAX_TEXTURE_STAGES) {
 		return false;
+	}
+	{
+		static int s_neutralLog = 0;
+		if (s_neutralLog < 200) {
+			const char * nm = "(unknown)";
+			if (m_boundTextures[stage] != nullptr) {
+				nm = (const char *)m_boundTextures[stage]->Get_Texture_Name();
+			}
+			FILE * dbg = fopen("unitnorm.log", "a");
+			if (dbg) { fprintf(dbg, "NEUTRAL stage=%u tex=%s\n", stage, nm); fclose(dbg); }
+			s_neutralLog++;
+		}
 	}
 
 	// Lazily create the shared 4x4 all-white texture (multiplicative identity,
@@ -1404,6 +2040,20 @@ void D3D11Backend::Set_Alpha_Test(bool enable, bool less_equal, float ref)
 	m_combiner.alphaTestLessEqual = le;
 	m_combiner.alphaTestRef = ref;
 	m_combinerDirty = true;
+	// The unit-normal pixel shader reads its own alpha-test state from cbUnit
+	// (not the FF combiner). Re-derive it here whenever the combiner changes so
+	// alpha-tested cutouts (tree canopies, prop grass, fence pickets) keep their
+	// discard while the unit normal pass is bound.
+	if (m_unitNormalIsActive && m_unitBuffer != nullptr) {
+		Vector3 sd(-m_lighting.lightDir[0][0], -m_lighting.lightDir[0][1], -m_lighting.lightDir[0][2]);
+		float sl = sd.X * sd.X + sd.Y * sd.Y + sd.Z * sd.Z;
+		if (sl < 1e-6f) { sd.Set(0.5f, -0.8f, 0.3f); } else { sd.Normalize(); }
+		Vector3 sc(m_lighting.lightDiffuse[0][0], m_lighting.lightDiffuse[0][1], m_lighting.lightDiffuse[0][2]);
+		if (sc.X * sc.X + sc.Y * sc.Y + sc.Z * sc.Z < 1e-6f) { sc.Set(1.0f, 1.0f, 1.0f); }
+		Vector3 amb(m_lighting.globalAmbient[0], m_lighting.globalAmbient[1], m_lighting.globalAmbient[2]);
+		if (amb.X * amb.X + amb.Y * amb.Y + amb.Z * amb.Z < 1e-6f) { amb.Set(0.3f, 0.3f, 0.3f); }
+		Set_Unit_Normal_Constants(sd, sc, amb, m_unitLastDetail, m_unitLastSecondary);
+	}
 }
 
 void D3D11Backend::Set_Alpha_Reference(float ref)
@@ -1418,6 +2068,17 @@ void D3D11Backend::Set_Alpha_Reference(float ref)
 	}
 	m_combiner.alphaTestRef = effective;
 	m_combinerDirty = true;
+	// Mirror into cbUnit for the active unit-normal pass (see Set_Alpha_Test).
+	if (m_unitNormalIsActive && m_unitBuffer != nullptr) {
+		Vector3 sd(-m_lighting.lightDir[0][0], -m_lighting.lightDir[0][1], -m_lighting.lightDir[0][2]);
+		float sl = sd.X * sd.X + sd.Y * sd.Y + sd.Z * sd.Z;
+		if (sl < 1e-6f) { sd.Set(0.5f, -0.8f, 0.3f); } else { sd.Normalize(); }
+		Vector3 sc(m_lighting.lightDiffuse[0][0], m_lighting.lightDiffuse[0][1], m_lighting.lightDiffuse[0][2]);
+		if (sc.X * sc.X + sc.Y * sc.Y + sc.Z * sc.Z < 1e-6f) { sc.Set(1.0f, 1.0f, 1.0f); }
+		Vector3 amb(m_lighting.globalAmbient[0], m_lighting.globalAmbient[1], m_lighting.globalAmbient[2]);
+		if (amb.X * amb.X + amb.Y * amb.Y + amb.Z * amb.Z < 1e-6f) { amb.Set(0.3f, 0.3f, 0.3f); }
+		Set_Unit_Normal_Constants(sd, sc, amb, m_unitLastDetail, m_unitLastSecondary);
+	}
 }
 
 void D3D11Backend::Set_Grayscale_Override(bool enable)
@@ -1540,6 +2201,7 @@ bool D3D11Backend::Upload_Vertices(const void * data, unsigned int size_bytes, u
 	if (!FVF_To_Input_Layout(fvf, layout) || layout.stride == 0) {
 		return false;
 	}
+	m_vertexFVF = fvf;
 
 	// Ensure the layout supplies every input the FF-emulation VS reads (POSITION
 	// is always present; BLENDWEIGHT / BLENDINDICES / COLOR0 / TEXCOORD0 / TEXCOORD1
@@ -1565,38 +2227,59 @@ bool D3D11Backend::Upload_Vertices(const void * data, unsigned int size_bytes, u
 		Append_Alias_Element(layout, "TEXCOORD", 1, DXGI_FORMAT_R32G32_FLOAT);
 	}
 
-	// Input layout, validated against the VS bytecode. Rebuilt on every upload
-	// here; a real integration would cache these keyed by FVF.
-	Safe_Release(m_inputLayout);
-	HRESULT hr = m_device->CreateInputLayout(
-		layout.elements, layout.num_elements,
-		m_vsBytecode, m_vsBytecodeSize, &m_inputLayout);
-	if (FAILED(hr)) {
-		return false;
+	// Input layout, validated against the VS bytecode. Cached per FVF - do NOT
+	// rebuild it on the hot upload path (driver input-assembly validation is
+	// expensive and was the source of the 1-2 FPS collapse).
+	ID3D11InputLayout *& cachedLayout = m_inputLayoutCache[fvf];
+	if (cachedLayout == nullptr) {
+		HRESULT hr = m_device->CreateInputLayout(
+			layout.elements, layout.num_elements,
+			m_vsBytecode, m_vsBytecodeSize, &cachedLayout);
+		if (FAILED(hr)) {
+			return false;
+		}
 	}
 
-	// Immutable vertex buffer holding the supplied bytes.
-	Safe_Release(m_vertexBuffer);
-	D3D11_BUFFER_DESC bd;
-	ZeroMemory(&bd, sizeof(bd));
-	bd.ByteWidth = size_bytes;
-	bd.Usage = D3D11_USAGE_IMMUTABLE;
-	bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-
-	D3D11_SUBRESOURCE_DATA srd;
-	ZeroMemory(&srd, sizeof(srd));
-	srd.pSysMem = data;
-
-	hr = m_device->CreateBuffer(&bd, &srd, &m_vertexBuffer);
-	if (FAILED(hr)) {
-		return false;
+	// Suballocate a disjoint slice from the single per-frame DEFAULT staging
+	// buffer (created once in Ensure_Dyn_VB_Cap, released next Begin_Scene).
+	// One CreateBuffer per frame instead of one per upload - this removed the
+	// ~300 driver allocations/frame that dropped FPS from ~30 to ~2. The slice
+	// is written once and never overwritten until the buffer is released, so no
+	// in-flight reuse (the Intel AV we hit with per-upload buffers / DYNAMIC+Map).
+	const UINT stride = layout.stride;
+	// Align each slice to its own stride so vertex[0] fetches land on a stride
+	// boundary (non-pow2 strides like 12 would mis-read under a fixed 16-byte
+	// align). The buffer is private per slice, so the slice itself is read-safe.
+	const UINT off = ((m_dynVBOffset + stride - 1u) / stride) * stride;
+	if (m_dynVB == nullptr || (off + size_bytes) > m_dynVBCap) {
+		if (!Ensure_Dyn_VB_Cap(off + size_bytes)) {
+			return false;
+		}
 	}
+	const bool profiling = Profiling_Enabled();
+	LARGE_INTEGER ut0;
+	if (profiling) { QueryPerformanceCounter(&ut0); }
+	m_dynVBOffset = off + size_bytes;
+	m_vertexBuffer = m_dynVB;
+	D3D11_BOX box;
+	box.left = off; box.top = 0; box.front = 0;
+	box.right = off + size_bytes; box.bottom = 1; box.back = 1;
+	m_context->UpdateSubresource(m_vertexBuffer, 0, &box, data, size_bytes, size_bytes);
 
-	m_vertexStride = layout.stride;
-	const UINT stride = m_vertexStride;
-	const UINT offset = 0;
-	m_context->IASetInputLayout(m_inputLayout);
-	m_context->IASetVertexBuffers(0, 1, &m_vertexBuffer, &stride, &offset);
+	m_vertexStride = stride;
+	const UINT ioff = off;
+	m_context->IASetInputLayout(cachedLayout);
+	m_context->IASetVertexBuffers(0, 1, &m_vertexBuffer, &stride, &ioff);
+	// Timing is opt-in (D3D11_PROFILE=1) - see Profiling_Enabled(). Skipping
+	// QueryPerformanceCounter here by default removes 2 QPC calls from every
+	// dynamic vertex upload (UI/particles), which can happen many times a frame.
+	if (profiling) {
+		LARGE_INTEGER ut1;
+		QueryPerformanceCounter(&ut1);
+		m_dbgUploadMs += static_cast<double>(ut1.QuadPart - ut0.QuadPart) /
+			static_cast<double>(m_qpcFreq.QuadPart) * 1000.0;
+		++m_dbgUploads;
+	}
 	return true;
 }
 
@@ -1606,24 +2289,36 @@ bool D3D11Backend::Upload_Indices16(const unsigned short * indices, unsigned int
 		return false;
 	}
 
-	Safe_Release(m_indexBuffer);
-	D3D11_BUFFER_DESC bd;
-	ZeroMemory(&bd, sizeof(bd));
-	bd.ByteWidth = count * sizeof(unsigned short);
-	bd.Usage = D3D11_USAGE_IMMUTABLE;
-	bd.BindFlags = D3D11_BIND_INDEX_BUFFER;
-
-	D3D11_SUBRESOURCE_DATA srd;
-	ZeroMemory(&srd, sizeof(srd));
-	srd.pSysMem = indices;
-
-	HRESULT hr = m_device->CreateBuffer(&bd, &srd, &m_indexBuffer);
-	if (FAILED(hr)) {
-		return false;
+	const UINT size_bytes = count * sizeof(unsigned short);
+	// Suballocate a disjoint slice from the single per-frame DEFAULT index buffer
+	// (created once in Ensure_Dyn_IB_Cap, released next Begin_Scene). See
+	// Upload_Vertices for the single-buffer / no-in-flight-reuse rationale.
+	const UINT sizeAligned = (size_bytes + 15u) & ~15u;
+	if (m_dynIB == nullptr || (m_dynIBOffset + sizeAligned) > m_dynIBCap) {
+		if (!Ensure_Dyn_IB_Cap(m_dynIBOffset + sizeAligned)) {
+			return false;
+		}
 	}
+	const bool profiling = Profiling_Enabled();
+	LARGE_INTEGER ut0;
+	if (profiling) { QueryPerformanceCounter(&ut0); }
+	const UINT off = m_dynIBOffset;
+	m_dynIBOffset += sizeAligned;
+	m_indexBuffer = m_dynIB;
+	D3D11_BOX box;
+	box.left = off; box.top = 0; box.front = 0;
+	box.right = off + size_bytes; box.bottom = 1; box.back = 1;
+	m_context->UpdateSubresource(m_indexBuffer, 0, &box, indices, size_bytes, size_bytes);
 
 	m_indexCount = count;
-	m_context->IASetIndexBuffer(m_indexBuffer, DXGI_FORMAT_R16_UINT, 0);
+	m_context->IASetIndexBuffer(m_indexBuffer, DXGI_FORMAT_R16_UINT, off);
+	if (profiling) {
+		LARGE_INTEGER ut1;
+		QueryPerformanceCounter(&ut1);
+		m_dbgUploadMs += static_cast<double>(ut1.QuadPart - ut0.QuadPart) /
+			static_cast<double>(m_qpcFreq.QuadPart) * 1000.0;
+		++m_dbgUploads;
+	}
 	return true;
 }
 
@@ -1897,6 +2592,35 @@ void D3D11Backend::Upload_Prof_Note_NC(TextureBaseClass * texture, unsigned int 
 
 void D3D11Backend::Begin_Scene()
 {
+	QueryPerformanceCounter(&m_frameStartT);
+	// God rays: the sun screen-position is refreshed by the terrain shader
+	// setup each frame; zero the intensity so a stale position can never glow
+	// (e.g. when the terrain normal path is inactive).
+	m_sunScreen[2] = 0.0f;
+	// Release the previous frame's dynamic buffers. By the time the next frame
+	// begins the prior frame's GPU work is done, so this is safe and keeps memory
+	// bounded (no per-upload leak, no in-flight reuse -> no TDR/AV).
+	Flush_Dynamic_Pools();
+
+	// Per-subsystem diagnostic hotkeys (see g_w3dnextDiagMode in RenderBackend.h).
+	// Each key disables exactly one suspect so the halo's source can be found in a
+	// single press instead of cycling F11 four times. Edge-triggered; works even
+	// from the menu before a map loads. Plain '1'-'4' is fine here (no modifier):
+	//   1 -> unit normalmap OFF, 2 -> screen filters OFF, 3 -> water OFF,
+	//   4 -> ALL suspects OFF, F11 -> NORMAL (all on / baseline).
+	struct DiagKey { int vk; int mode; };
+	static const DiagKey s_diagKeys[] = {
+		{ '1', 3 }, { '2', 2 }, { '3', 1 }, { '4', 4 }, { VK_F11, 0 }
+	};
+	static bool s_prevKey[5] = {};
+	for (int i = 0; i < 5; ++i) {
+		bool down = (GetAsyncKeyState(s_diagKeys[i].vk) & 0x8000) != 0;
+		if (down && !s_prevKey[i]) {
+			Set_W3DNext_Diag_Mode(s_diagKeys[i].mode);
+		}
+		s_prevKey[i] = down;
+	}
+
 	// D3D11 has no BeginScene; just make sure the backbuffer targets are bound
 	// (a later render-to-texture pass may have unbound them).
 	Bind_Back_Buffer_Targets();
@@ -2078,8 +2802,117 @@ void D3D11Backend::End_Scene(bool flip_frame)
 		if (Gpu_Profile_Enabled() && (frame % RB_GPUPROF_EMIT_FRAMES) == 0u) {
 			Upload_Prof_Emit(frame);
 		}
+		// F8 toggles color grading, F6 toggles the night-vision filter - both
+		// edge-detected so holding a key flips exactly once.
+		{
+			static bool s_gradeKeyWasDown = false;
+			const bool down = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+			if (down && !s_gradeKeyWasDown
+				&& m_gradePixelShader != nullptr && m_gradeVertexShader != nullptr
+				&& m_gradeBuffer != nullptr && m_gradeSampler != nullptr) {
+				m_gradeEnabled = !m_gradeEnabled;
+			}
+			s_gradeKeyWasDown = down;
+
+			static bool s_nvKeyWasDown = false;
+			const bool nvDown = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
+			if (nvDown && !s_nvKeyWasDown && m_gradeEnabled) {
+				m_gradeNightVision = !m_gradeNightVision;
+			}
+			s_nvKeyWasDown = nvDown;
+		}
+
+		// F10 dumps the finished frame (post-grade) as a 24-bit uncompressed TGA
+		// so render issues can be inspected offline. Default path
+		// E:\GAVAD_Test\dncshot.tga, override with D3D11_SHOT=<file>.
+		{
+			static bool s_shotKeyWasDown = false;
+			const bool shotDown = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+			if (shotDown && !s_shotKeyWasDown && m_swapChain != nullptr) {
+				unsigned int sw = 0, sh = 0;
+				if (Read_Back_Buffer(nullptr, sw, sh) && sw > 0 && sh > 0) {
+					std::vector<unsigned char> rgb(static_cast<size_t>(sw) * sh * 3u);
+					if (Read_Back_Buffer(rgb.data(), sw, sh)) {
+						const char * path = W3DNext_GetEnv("D3D11_SHOT");
+						FILE * f = std::fopen(path != nullptr ? path : "E:\\GAVAD_Test\\dncshot.tga", "wb");
+						if (f != nullptr) {
+							unsigned char hdr[18];
+							ZeroMemory(hdr, sizeof(hdr));
+							hdr[2] = 2;                    // uncompressed true-color
+							hdr[12] = static_cast<unsigned char>(sw & 0xFF);
+							hdr[13] = static_cast<unsigned char>((sw >> 8) & 0xFF);
+							hdr[14] = static_cast<unsigned char>(sh & 0xFF);
+							hdr[15] = static_cast<unsigned char>((sh >> 8) & 0xFF);
+							hdr[16] = 24;                  // bits per pixel
+							hdr[17] = 0x20;                // top-down rows
+							std::fwrite(hdr, 1, sizeof(hdr), f);
+							for (unsigned int row = 0; row < sh; ++row) {
+								const unsigned char * r = rgb.data() + static_cast<size_t>(row) * sw * 3u;
+								for (unsigned int x = 0; x < sw; ++x) {
+									unsigned char bgr[3] = { r[x*3+2], r[x*3+1], r[x*3+0] };
+									std::fwrite(bgr, 1, 3, f);
+								}
+							}
+							std::fclose(f);
+						}
+					}
+				}
+			}
+			s_shotKeyWasDown = shotDown;
+		}
+		// NOTE: the color-grade/god-ray pass now runs from W3DDisplay::draw()
+		// right after the 3D scene and BEFORE the 2D UI (the radial march must
+		// not sample interface elements). Only the hotkeys live here now.
 		Handle_Present_Result(m_swapChain->Present(0, 0));
 		Gpu_Profile_Close_Frame();
+		// Per-frame resource diagnostic: watch for unbounded growth (the 200->1
+		// decay). texEntries rising == texture-cache leak; up(+N) large every frame
+		// == upload churn; vbPool/ibPool rising == dynamic-buffer leak.
+		// draws(+N) and ms = CPU time of the frame (time since previous present).
+		{
+			static unsigned int s_dHits = 0, s_dUp = 0, s_dEv = 0, s_dDraws = 0;
+			static LARGE_INTEGER s_dFreq = { 0 }, s_dPrev = { 0 };
+			if (s_dFreq.QuadPart == 0) {
+				QueryPerformanceFrequency(&s_dFreq);
+			}
+			LARGE_INTEGER now;
+			QueryPerformanceCounter(&now);
+			const double dt = (s_dPrev.QuadPart != 0)
+				? static_cast<double>(now.QuadPart - s_dPrev.QuadPart) / static_cast<double>(s_dFreq.QuadPart) * 1000.0
+				: 0.0;
+			s_dPrev = now;
+			const unsigned int dHits = m_texCacheHits - s_dHits;
+			const unsigned int dUp = m_texCacheUploads - s_dUp;
+			const unsigned int dEv = m_texCacheEvictions - s_dEv;
+			const unsigned int dDraws = m_frameDrawCalls;
+			const double dbgApply = m_dbgApplyMs, dbgConst = m_dbgConstMs;
+			const double dbgOther = m_dbgOtherMs, dbgDraw = m_dbgDrawMs;
+			const double dbgSetTex = m_dbgSetTexMs;
+			const double dbgUp = m_dbgUploadMs;
+			const unsigned int dbgUploads = m_dbgUploads;
+			s_dHits = m_texCacheHits; s_dUp = m_texCacheUploads; s_dEv = m_texCacheEvictions;
+			m_frameDrawCalls = 0;
+			m_dbgApplyMs = 0.0; m_dbgConstMs = 0.0; m_dbgOtherMs = 0.0; m_dbgDrawMs = 0.0;
+			m_dbgSetTexMs = 0.0; m_dbgUploadMs = 0.0; m_dbgUploads = 0;
+			char line[512];
+			std::snprintf(line, sizeof(line),
+				"[frame] f=%u texEntries=%u hits(+%u) up(+%u) evict(+%u) draws(+%u) ms=%.1f rms=%.1f apply=%.1f const=%.1f other=%.1f draw=%.1f settex=%.1f uploads(+%u) upMs=%.1f vbKB=%u ibKB=%u",
+				frame,
+				static_cast<unsigned int>(m_textureCache.size()),
+				dHits, dUp, dEv, dDraws, dt,
+				(s_dFreq.QuadPart != 0)
+					? static_cast<double>(now.QuadPart - m_frameStartT.QuadPart) / static_cast<double>(s_dFreq.QuadPart) * 1000.0
+					: 0.0,
+				dbgApply, dbgConst, dbgOther, dbgDraw, dbgSetTex,
+				dbgUploads, dbgUp,
+				m_dynVBOffset / 1024u, m_dynIBOffset / 1024u);
+			D3D11_Log_Line(line);
+		}
+		// Release this frame's dynamic buffers after Present. The draws are
+		// submitted; releasing only drops our refcount and the driver keeps a GPU
+		// reference until they finish - so this is safe and bounds memory/FPS even
+		// if Begin_Scene's flush is missed.
+		Flush_Dynamic_Pools();
 	}
 }
 
@@ -2122,13 +2955,13 @@ void D3D11Backend::Clear(bool clear_color, bool clear_z_stencil, const Vector3 &
 		return;
 	}
 
-	if (clear_color && m_backBufferRTV != nullptr) {
+	if (clear_color && m_currentRTV != nullptr) {
 		const float rgba[4] = { color.X, color.Y, color.Z, dest_alpha };
-		m_context->ClearRenderTargetView(m_backBufferRTV, rgba);
+		m_context->ClearRenderTargetView(m_currentRTV, rgba);
 	}
-	if (clear_z_stencil && m_depthStencilView != nullptr) {
+	if (clear_z_stencil && m_currentDSV != nullptr) {
 		m_context->ClearDepthStencilView(
-			m_depthStencilView,
+			m_currentDSV,
 			D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL,
 			z,
 			static_cast<UINT8>(stencil));
@@ -2317,10 +3150,159 @@ void D3D11Backend::Set_Blend_Func(RenderBackendBlendFactor src, RenderBackendBle
 	}
 }
 
+// Raw D3DBLEND_* writes forwarded from DX8Wrapper::Set_DX8_Render_State (the
+// soft-water-edge DESTALPHA blend and the water alpha pass set these through
+// the legacy path, which has no ShaderClass equivalent). Single-sided so the
+// render-state vector stays the single source of truth.
+static RenderBackendBlendFactor D3DBlend_To_RB(unsigned int v)
+{
+	switch (v) {
+	case D3DBLEND_ZERO:            return RB_BLEND_ZERO;
+	case D3DBLEND_SRCCOLOR:        return RB_BLEND_SRCCOLOR;
+	case D3DBLEND_INVSRCCOLOR:     return RB_BLEND_INVSRCCOLOR;
+	case D3DBLEND_SRCALPHA:        return RB_BLEND_SRCALPHA;
+	case D3DBLEND_INVSRCALPHA:     return RB_BLEND_INVSRCALPHA;
+	case D3DBLEND_DESTALPHA:       return RB_BLEND_DESTALPHA;
+	case D3DBLEND_INVDESTALPHA:    return RB_BLEND_INVDESTALPHA;
+	case D3DBLEND_DESTCOLOR:       return RB_BLEND_DESTCOLOR;
+	case D3DBLEND_INVDESTCOLOR:    return RB_BLEND_INVDESTCOLOR;
+	case D3DBLEND_ONE:
+	default:                       return RB_BLEND_ONE;
+	}
+}
+
+void D3D11Backend::Set_Raw_Blend_Enable(unsigned int enable)
+{
+	Set_Blend_Enable(enable != 0);
+}
+
+void D3D11Backend::Set_Raw_Src_Blend(unsigned int d3dblend)
+{
+	const RenderBackendBlendFactor f = D3DBlend_To_RB(d3dblend);
+	if (m_renderState.srcBlend != f) {
+		m_renderState.srcBlend = f;
+		m_renderStateDirty = true;
+	}
+}
+
+void D3D11Backend::Set_Raw_Dst_Blend(unsigned int d3dblend)
+{
+	const RenderBackendBlendFactor f = D3DBlend_To_RB(d3dblend);
+	if (m_renderState.dstBlend != f) {
+		m_renderState.dstBlend = f;
+		m_renderStateDirty = true;
+	}
+}
+
+// Raw D3DRS_STENCIL* writes (52..59) forwarded from DX8Wrapper - the shadow
+// volume passes configure stenciling through the legacy path. D3DCMPFUNC and
+// D3DSTENCILOP are 1-based in DX8 and 0-based here, hence the -1 maps.
+void D3D11Backend::Set_Raw_Stencil(unsigned int d3drs, unsigned int value)
+{
+	switch (d3drs) {
+	case 52: // D3DRS_STENCILENABLE
+		if (m_renderState.stencilEnable != (value != 0)) {
+			m_renderState.stencilEnable = (value != 0);
+			m_renderStateDirty = true;
+		}
+		break;
+	case 53: // D3DRS_STENCILFAIL: D3DSTENCILOP_KEEP=1..DECR=8 -> RB 0..7
+		if (m_renderState.stencilFail != (RenderBackendStencilOp)(value - 1)) {
+			m_renderState.stencilFail = (RenderBackendStencilOp)(value - 1);
+			m_renderStateDirty = true;
+		}
+		break;
+	case 54: // D3DRS_STENCILZFAIL
+		if (m_renderState.stencilZFail != (RenderBackendStencilOp)(value - 1)) {
+			m_renderState.stencilZFail = (RenderBackendStencilOp)(value - 1);
+			m_renderStateDirty = true;
+		}
+		break;
+	case 55: // D3DRS_STENCILPASS
+		if (m_renderState.stencilPass != (RenderBackendStencilOp)(value - 1)) {
+			m_renderState.stencilPass = (RenderBackendStencilOp)(value - 1);
+			m_renderStateDirty = true;
+		}
+		break;
+	case 56: // D3DRS_STENCILFUNC: D3DCMPFUNC NEVER=1..ALWAYS=8 -> RB_CMP 0..7
+		if (m_renderState.stencilFunc != (RenderBackendCmpFunc)(value - 1)) {
+			m_renderState.stencilFunc = (RenderBackendCmpFunc)(value - 1);
+			m_renderStateDirty = true;
+		}
+		break;
+	case 57: // D3DRS_STENCILREF
+		if (m_renderState.stencilRef != value) {
+			m_renderState.stencilRef = value;
+			m_renderStateDirty = true;
+		}
+		break;
+	case 58: // D3DRS_STENCILMASK
+		if (m_renderState.stencilMask != value) {
+			m_renderState.stencilMask = value;
+			m_renderStateDirty = true;
+		}
+		break;
+	case 59: // D3DRS_STENCILWRITEMASK
+		if (m_renderState.stencilWriteMask != value) {
+			m_renderState.stencilWriteMask = value;
+			m_renderStateDirty = true;
+		}
+		break;
+	// Two-sided stencil (185..189) - the shadow-volume passes rely on these to
+	// set DIFFERENT ops for front- vs back-facing shadow polygons (e.g. incr on
+	// back-face depth-fail, decr on front-face depth-fail) so the volume counts
+	// correctly. These fell into the default case (silently dropped) before,
+	// which left D3D11States.cpp always mirroring the front-face op onto the
+	// back face - breaking the volume count and making shadows render as if
+	// stuck to the casting object instead of projected onto the ground.
+	case 185: // D3DRS_TWOSIDEDSTENCILMODE
+		if (m_renderState.twoSidedStencil != (value != 0)) {
+			m_renderState.twoSidedStencil = (value != 0);
+			m_renderStateDirty = true;
+		}
+		break;
+	case 186: // D3DRS_CCW_STENCILFAIL
+		if (m_renderState.ccwStencilFail != (RenderBackendStencilOp)(value - 1)) {
+			m_renderState.ccwStencilFail = (RenderBackendStencilOp)(value - 1);
+			m_renderStateDirty = true;
+		}
+		break;
+	case 187: // D3DRS_CCW_STENCILZFAIL
+		if (m_renderState.ccwStencilZFail != (RenderBackendStencilOp)(value - 1)) {
+			m_renderState.ccwStencilZFail = (RenderBackendStencilOp)(value - 1);
+			m_renderStateDirty = true;
+		}
+		break;
+	case 188: // D3DRS_CCW_STENCILPASS
+		if (m_renderState.ccwStencilPass != (RenderBackendStencilOp)(value - 1)) {
+			m_renderState.ccwStencilPass = (RenderBackendStencilOp)(value - 1);
+			m_renderStateDirty = true;
+		}
+		break;
+	case 189: // D3DRS_CCW_STENCILFUNC
+		if (m_renderState.ccwStencilFunc != (RenderBackendCmpFunc)(value - 1)) {
+			m_renderState.ccwStencilFunc = (RenderBackendCmpFunc)(value - 1);
+			m_renderStateDirty = true;
+		}
+		break;
+	default:
+		break;
+	}
+}
+
 void D3D11Backend::Set_Blend_Op(RenderBackendBlendOp op)
 {
 	if (m_renderState.blendOp != op) {
 		m_renderState.blendOp = op;
+		m_renderStateDirty = true;
+	}
+}
+
+void D3D11Backend::Set_Color_Write_Enable(unsigned int mask)
+{
+	const unsigned int m = mask & 0xF;
+	if (m_renderState.colorWriteEnable != m) {
+		m_renderState.colorWriteEnable = m;
 		m_renderStateDirty = true;
 	}
 }
@@ -2385,10 +3367,20 @@ void D3D11Backend::Apply_Render_State_Changes()
 	ID3D11RasterizerState * raster = m_stateCache.Get_Rasterizer_State(m_device, m_renderState);
 
 	const float blend_factor[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-	m_context->OMSetBlendState(blend, blend_factor, 0xffffffffu);
-	m_context->OMSetDepthStencilState(depth, 0);
-	if (raster != nullptr) {
-		m_context->RSSetState(raster);
+	if (blend != m_lastBlendState) {
+		m_context->OMSetBlendState(blend, blend_factor, 0xffffffffu);
+		m_lastBlendState = blend;
+	}
+	if (depth != m_lastDepthState || m_lastStencilRef != m_renderState.stencilRef) {
+		m_context->OMSetDepthStencilState(depth, m_renderState.stencilRef);
+		m_lastDepthState = depth;
+		m_lastStencilRef = m_renderState.stencilRef;
+	}
+	if (raster != m_lastRasterState) {
+		if (raster != nullptr) {
+			m_context->RSSetState(raster);
+		}
+		m_lastRasterState = raster;
 	}
 
 	m_activeBlendState = blend;
@@ -2410,8 +3402,13 @@ void D3D11Backend::Apply_Default_State()
 void D3D11Backend::Invalidate_Cached_Render_States()
 {
 	// Force the next Apply_Render_State_Changes to re-bind, e.g. after external
-	// code touched the immediate context's OM/RS stages.
+	// code touched the immediate context's OM/RS stages. Clear the last-bound
+	// cache too so the re-bind is unconditional (not skipped as a no-op).
 	m_renderStateDirty = true;
+	m_lastBlendState = nullptr;
+	m_lastDepthState = nullptr;
+	m_lastRasterState = nullptr;
+	m_lastStencilRef = 0xFFFFFFFFu;   // force the OMSet (ref is its argument)
 }
 
 void D3D11Backend::Set_Transform(TransformKind transform, const Matrix4x4 & m)
@@ -2587,11 +3584,36 @@ static void Log_Draw(const char * what, unsigned int polys, unsigned int verts,
 		return;
 	}
 	const RenderStateVector & rs = be.Peek_Render_State();
+
+	// Optional overlay-only filter (D3D11_DRAWLOG_OVERLAY=1): only log
+	// transparent / fullscreen-overlay draws (additive, alpha blend, or
+	// depth-always-no-write). These are the candidates for a fullscreen
+	// "white flash" post-process quad and for the spread menu icons.
+	static int s_overlayOnly = -1;
+	if (s_overlayOnly < 0) {
+		const char * ov = W3DNext_GetEnv("D3D11_DRAWLOG_OVERLAY");
+		s_overlayOnly = (ov != nullptr && ov[0] == '1') ? 1 : 0;
+	}
+	if (s_overlayOnly == 1) {
+		const bool additive = rs.blendEnable && rs.srcBlend == RB_BLEND_SRCALPHA && rs.dstBlend == RB_BLEND_ONE;
+		const bool alphaBlend = rs.blendEnable && rs.srcBlend == RB_BLEND_SRCALPHA && rs.dstBlend == RB_BLEND_INVSRCALPHA;
+		const bool overlay = rs.depthFunc == RB_CMP_ALWAYS && !rs.depthWrite;
+		if (!(additive || alphaBlend || overlay)) {
+			return;
+		}
+	}
+
+	// Timestamp (ms since first logged draw) so we can correlate to the
+	// "~3s after load" white-flash window the user reported.
+	static ULONGLONG s_t0 = 0;
+	if (s_t0 == 0) { s_t0 = GetTickCount64(); }
+	const ULONGLONG tMs = GetTickCount64() - s_t0;
+
 	static unsigned int s_drawIndex = 0;
 	std::fprintf(f,
-		"[draw %u] %s polys=%u verts=%u start=%u | blend=%d src=%d dst=%d | depthTest=%d write=%d func=%d | tex=%d dirtyAtDraw=%d"
+		"[t=%llu ms][draw %u] %s polys=%u verts=%u start=%u | blend=%d src=%d dst=%d | depthTest=%d write=%d func=%d | tex=%d dirtyAtDraw=%d"
 		" | shader=0x%08x stages=%u c0=%u/%u,%u a0=%u/%u,%u texfmt=%u texname=%s\n",
-		s_drawIndex++, what, polys, verts, start_index,
+		tMs, s_drawIndex++, what, polys, verts, start_index,
 		(int)rs.blendEnable, (int)rs.srcBlend, (int)rs.dstBlend,
 		(int)rs.depthEnable, (int)rs.depthWrite, (int)rs.depthFunc,
 		(int)textured, (int)was_dirty,
@@ -2600,6 +3622,79 @@ static void Log_Draw(const char * what, unsigned int polys, unsigned int verts,
 		be.Peek_Combiner_Alpha0(0), be.Peek_Combiner_Alpha0(1), be.Peek_Combiner_Alpha0(2),
 		be.Peek_Stage_Tex_Format(0), be.Peek_Stage_Tex_Name(0));
 	std::fflush(f);
+}
+
+void D3D11Backend::Mark_Draw_Complete()
+{
+	// Buffers are released in bulk by Flush_Dynamic_Pools() at the next
+	// Begin_Scene (when the previous frame's GPU work is done). Nothing to do
+	// per-draw: reusing in-flight DEFAULT buffers via UpdateSubresource crashes
+	// the Intel D3D11 driver (AV), so we never reuse within a frame.
+}
+
+bool D3D11Backend::Ensure_Dyn_VB_Cap(unsigned int need)
+{
+	if (m_dynVB != nullptr && need <= m_dynVBCap) {
+		return true;
+	}
+	Safe_Release(m_dynVB);
+	unsigned int cap = m_dynVBCap ? m_dynVBCap : (4u * 1024u * 1024u);
+	while (cap < need) {
+		cap = (cap > 0x40000000u) ? 0x80000000u : (cap * 2u);
+	}
+	D3D11_BUFFER_DESC bd;
+	ZeroMemory(&bd, sizeof(bd));
+	bd.ByteWidth = cap;
+	bd.Usage = D3D11_USAGE_DEFAULT;
+	bd.CPUAccessFlags = 0;
+	bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+	if (FAILED(m_device->CreateBuffer(&bd, nullptr, &m_dynVB))) {
+		m_dynVBCap = 0;
+		m_dynVBOffset = 0;
+		return false;
+	}
+	m_dynVBCap = cap;
+	m_dynVBOffset = 0;
+	return true;
+}
+
+bool D3D11Backend::Ensure_Dyn_IB_Cap(unsigned int need)
+{
+	if (m_dynIB != nullptr && need <= m_dynIBCap) {
+		return true;
+	}
+	Safe_Release(m_dynIB);
+	unsigned int cap = m_dynIBCap ? m_dynIBCap : (1u * 1024u * 1024u);
+	while (cap < need) {
+		cap = (cap > 0x10000000u) ? 0x20000000u : (cap * 2u);
+	}
+	D3D11_BUFFER_DESC bd;
+	ZeroMemory(&bd, sizeof(bd));
+	bd.ByteWidth = cap;
+	bd.Usage = D3D11_USAGE_DEFAULT;
+	bd.CPUAccessFlags = 0;
+	bd.BindFlags = D3D11_BIND_INDEX_BUFFER;
+	if (FAILED(m_device->CreateBuffer(&bd, nullptr, &m_dynIB))) {
+		m_dynIBCap = 0;
+		m_dynIBOffset = 0;
+		return false;
+	}
+	m_dynIBCap = cap;
+	m_dynIBOffset = 0;
+	return true;
+}
+
+void D3D11Backend::Flush_Dynamic_Pools()
+{
+	// Release the per-frame staging buffers (now the previous frame's GPU work
+	// is done, so no slice is in flight). A fresh buffer is allocated lazily by
+	// the first upload of the new frame.
+	Safe_Release(m_dynVB);
+	m_dynVBCap = 0;
+	m_dynVBOffset = 0;
+	Safe_Release(m_dynIB);
+	m_dynIBCap = 0;
+	m_dynIBOffset = 0;
 }
 
 void D3D11Backend::Draw_Triangles(
@@ -2612,6 +3707,18 @@ void D3D11Backend::Draw_Triangles(
 		D3D11_TRACE_NOOP("no-op: no engine VB/IB uploaded (Draw_Triangles skipped)");
 		return;
 	}
+	// W3DNext: catch the unit-normal state leak that makes shadow/decal quads
+	// render magenta/pink. When the unit-normal pipeline is bound, the FIRST draw
+	// through here is the real unit mesh (capture its FVF); any later draw whose
+	// FVF differs (a shadow volume or decal quad) inherited the bound pipeline
+	// without re-driving the unit-normal flag, so force the FF combiner back on.
+	if (m_unitNormalIsActive) {
+		if (m_unitNormalFVF == 0xFFFFFFFFu) {
+			m_unitNormalFVF = m_vertexFVF;   // capture the genuine unit mesh FVF
+		} else if (m_vertexFVF != m_unitNormalFVF) {
+			Set_Unit_Normal_Pixel_Shader(false);
+		}
+	}
 	Log_Draw("tris", polygon_count, vertex_count, start_index,
 		*this, m_renderStateDirty, m_stageSRV[0] != nullptr);
 	// DX8 semantics: deferred render state is applied AT DRAW TIME
@@ -2621,18 +3728,39 @@ void D3D11Backend::Draw_Triangles(
 	// the 2D menu path ran on the never-bound D3D11 default depth state
 	// (LESS + depth-write) and the first full-screen quad z-rejected every
 	// later same-depth menu quad.
+	// Timing is opt-in (D3D11_PROFILE=1, see Profiling_Enabled()). This is the
+	// single busiest call in the renderer - hundreds to thousands of these per
+	// frame in a big battle - so by default we skip all 5 QueryPerformanceCounter
+	// calls entirely rather than pay their cost just to fill in debug stats
+	// nobody is reading.
+	const bool profiling = Profiling_Enabled();
+	LARGE_INTEGER t0, t1, t2, t3, t4;
+	if (profiling) { QueryPerformanceCounter(&t0); }
 	Apply_Render_State_Changes();
+	if (profiling) { QueryPerformanceCounter(&t1); }
 	Update_Constant_Buffer();
+	if (profiling) { QueryPerformanceCounter(&t2); }
 	Update_Combiner_Buffer();
 	Update_Lighting_Buffer();
 	Update_Fog_Buffer();
 	Update_Skinning_Buffer();
 	Update_TexGen_Buffer();
+	if (profiling) { QueryPerformanceCounter(&t3); }
 	m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 	// A triangle list has 3 indices per polygon. m_indexBaseOffset is the DX8
 	// SetIndices base-vertex (D3D8 adds it to every index); it is 0 for the smoke
 	// test and the dynamic 2D path, non-zero for static meshes that share a VB.
 	m_context->DrawIndexed(polygon_count * 3, start_index, static_cast<INT>(m_indexBaseOffset));
+	++m_frameDrawCalls;
+	if (profiling) {
+		QueryPerformanceCounter(&t4);
+		const double f = static_cast<double>(m_qpcFreq.QuadPart);
+		m_dbgApplyMs += static_cast<double>(t1.QuadPart - t0.QuadPart) / f * 1000.0;
+		m_dbgConstMs += static_cast<double>(t2.QuadPart - t1.QuadPart) / f * 1000.0;
+		m_dbgOtherMs += static_cast<double>(t3.QuadPart - t2.QuadPart) / f * 1000.0;
+		m_dbgDrawMs += static_cast<double>(t4.QuadPart - t3.QuadPart) / f * 1000.0;
+	}
+	Mark_Draw_Complete();
 }
 
 void D3D11Backend::Draw_Triangles(
@@ -2660,13 +3788,19 @@ void D3D11Backend::Draw_Strip(
 	}
 	Log_Draw("strip", primitive_count, vertex_count, start_index,
 		*this, m_renderStateDirty, m_stageSRV[0] != nullptr);
+	const bool profiling = Profiling_Enabled();
+	LARGE_INTEGER t0, t1, t2, t3, t4;
+	if (profiling) { QueryPerformanceCounter(&t0); }
 	Apply_Render_State_Changes(); // draw-time state flush (DX8 semantics; see Draw_Triangles)
+	if (profiling) { QueryPerformanceCounter(&t1); }
 	Update_Constant_Buffer();
+	if (profiling) { QueryPerformanceCounter(&t2); }
 	Update_Combiner_Buffer();
 	Update_Lighting_Buffer();
 	Update_Fog_Buffer();
 	Update_Skinning_Buffer();
 	Update_TexGen_Buffer();
+	if (profiling) { QueryPerformanceCounter(&t3); }
 	m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 	// Same base-vertex handling as Draw_Triangles: D3D8 adds the SetIndices
 	// base to every index. Non-zero for 2nd+ wave-track batches (the only
@@ -2674,6 +3808,16 @@ void D3D11Backend::Draw_Strip(
 	// Count contract (IRenderBackend.h): primitive_count TRIANGLES; a strip of
 	// N triangles consumes N + 2 indices (DrawIndexed wants the index count).
 	m_context->DrawIndexed(primitive_count + 2, start_index, static_cast<INT>(m_indexBaseOffset));
+	++m_frameDrawCalls;
+	if (profiling) {
+		QueryPerformanceCounter(&t4);
+		const double f = static_cast<double>(m_qpcFreq.QuadPart);
+		m_dbgApplyMs += static_cast<double>(t1.QuadPart - t0.QuadPart) / f * 1000.0;
+		m_dbgConstMs += static_cast<double>(t2.QuadPart - t1.QuadPart) / f * 1000.0;
+		m_dbgOtherMs += static_cast<double>(t3.QuadPart - t2.QuadPart) / f * 1000.0;
+		m_dbgDrawMs += static_cast<double>(t4.QuadPart - t3.QuadPart) / f * 1000.0;
+	}
+	Mark_Draw_Complete();
 }
 
 void D3D11Backend::Set_Vertex_Shader(unsigned long vertex_shader)
@@ -2824,8 +3968,163 @@ bool D3D11Backend::Read_Back_Buffer(unsigned char * rgb_dst, unsigned int & widt
 	return ok;
 }
 
+void D3D11Backend::Set_Sun_Screen(float x, float y, float intensity)
+{
+	// Diagnostic: log the first few updates INCLUDING zeros so a dead
+	// projection is distinguishable from weak rays.
+	static int s_logCount = 0;
+	if (s_logCount < 40) {
+		if (s_logCount < 4 || (s_logCount % 10) == 0) {
+			char line[128];
+			std::snprintf(line, sizeof(line),
+				"[D3D11] god rays #%d: sun uv=(%.3f, %.3f) intensity=%.3f",
+				s_logCount, x, y, intensity);
+			D3D11_Log_Line(line);
+		}
+		++s_logCount;
+	}
+	m_sunScreen[0] = x;
+	m_sunScreen[1] = y;
+	m_sunScreen[2] = intensity;
+}
+
+void D3D11Backend::Apply_Color_Grade()
+{
+	// W3DNext color-grading post-process. Runs once per frame at End_Frame,
+	// just before Present: copies the finished back buffer into an off-screen
+	// texture, then redraws it full-screen through the grade shader pair with
+	// brightness / contrast / saturation / tint constants applied. One copy +
+	// one fullscreen draw; the FF pipeline state is restored afterwards.
+	if (m_device == nullptr || m_context == nullptr || m_swapChain == nullptr
+		|| !m_pipelineReady || m_backBufferRTV == nullptr
+		|| m_gradePixelShader == nullptr || m_gradeVertexShader == nullptr
+		|| m_gradeBuffer == nullptr || m_gradeSampler == nullptr) {
+		static bool s_gradeFailLogged = false;
+		if (!s_gradeFailLogged) {
+			char line[192];
+			std::snprintf(line, sizeof(line),
+				"[D3D11] grade pass SKIP: pipelineReady=%d rtv=%d ps=%d vs=%d buf=%d samp=%d",
+				(int)m_pipelineReady, (int)(m_backBufferRTV != nullptr),
+				(int)(m_gradePixelShader != nullptr), (int)(m_gradeVertexShader != nullptr),
+				(int)(m_gradeBuffer != nullptr), (int)(m_gradeSampler != nullptr));
+			D3D11_Log_Line(line);
+			s_gradeFailLogged = true;
+		}
+		return;
+	}
+	{
+		static bool s_gradeRunLogged = false;
+		if (!s_gradeRunLogged) {
+			D3D11_Log_Line("[D3D11] grade pass RUNNING");
+			s_gradeRunLogged = true;
+		}
+	}
+	ID3D11Texture2D * back = nullptr;
+	if (FAILED(m_swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&back))) || back == nullptr) {
+		return;
+	}
+	D3D11_TEXTURE2D_DESC desc;
+	back->GetDesc(&desc);
+	if (m_gradeTexture == nullptr || m_gradeWidth != desc.Width || m_gradeHeight != desc.Height) {
+		if (m_gradeSRV != nullptr) { m_gradeSRV->Release(); m_gradeSRV = nullptr; }
+		if (m_gradeTexture != nullptr) { m_gradeTexture->Release(); m_gradeTexture = nullptr; }
+		D3D11_TEXTURE2D_DESC td = desc;
+		td.MipLevels = 1;
+		td.ArraySize = 1;
+		td.Usage = D3D11_USAGE_DEFAULT;
+		td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		td.CPUAccessFlags = 0;
+		td.MiscFlags = 0;
+		if (SUCCEEDED(m_device->CreateTexture2D(&td, nullptr, &m_gradeTexture))) {
+			m_device->CreateShaderResourceView(m_gradeTexture, nullptr, &m_gradeSRV);
+		}
+		if (m_gradeSRV == nullptr) {
+			if (m_gradeTexture != nullptr) { m_gradeTexture->Release(); m_gradeTexture = nullptr; }
+			back->Release();
+			return;
+		}
+		m_gradeWidth = desc.Width;
+		m_gradeHeight = desc.Height;
+	}
+	m_context->CopyResource(m_gradeTexture, back);
+
+	// Cinematic defaults (neutral = all ones). Tune here.
+	struct GradeConstants { float Params[4]; float Tint[4]; float Mode[4]; float Sun[4]; float Bloom[4]; };
+	GradeConstants gc;
+	gc.Params[0] = 1.04f;  // brightness
+	gc.Params[1] = 1.12f;  // contrast
+	gc.Params[2] = 1.14f;  // saturation
+	gc.Params[3] = static_cast<float>(GetTickCount() % 3600000) * 0.001f;  // time: dust drift
+	gc.Tint[0] = 1.02f;
+	gc.Tint[1] = 1.00f;
+	gc.Tint[2] = 0.97f;
+	gc.Tint[3] = 1.0f;
+	gc.Mode[0] = m_gradeNightVision ? 1.0f : 0.0f;
+	gc.Mode[1] = 1.0f;     // god rays enable
+	gc.Mode[2] = 1.0f;     // filmic tone-map + bloom enable
+	gc.Mode[3] = 0.0f;
+	gc.Sun[0] = m_sunScreen[0];
+	gc.Sun[1] = m_sunScreen[1];
+	gc.Sun[2] = m_sunScreen[2];
+	gc.Sun[3] = 0.0f;
+	gc.Bloom[0] = 1.06f;   // exposure
+	gc.Bloom[1] = 0.40f;   // bloom strength
+	gc.Bloom[2] = 0.55f;   // bloom threshold
+	gc.Bloom[3] = 1.0f;    // bloom radius (texels)
+	m_context->UpdateSubresource(m_gradeBuffer, 0, nullptr, &gc, 0, 0);
+
+	m_backBufferRTV->AddRef();
+	ID3D11RenderTargetView * rtv = m_backBufferRTV;
+	// No depth view: the fullscreen quad must never depth-test/write. Only 2D
+	// UI draws follow this pass, none of which need the depth buffer.
+	m_context->OMSetRenderTargets(1, &rtv, nullptr);
+	m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+	m_context->IASetInputLayout(nullptr);
+	m_context->VSSetShader(m_gradeVertexShader, nullptr, 0);
+	m_context->PSSetShader(m_gradePixelShader, nullptr, 0);
+	m_context->PSSetConstantBuffers(0, 1, &m_gradeBuffer);
+	m_context->PSSetShaderResources(0, 1, &m_gradeSRV);
+	m_context->PSSetSamplers(0, 1, &m_gradeSampler);
+	m_context->Draw(4, 0);
+	rtv->Release();
+
+	// Restore the FF pipeline and unbind the SRV so next frame's CopyResource
+	// into the same texture never races a bound input.
+	ID3D11ShaderResourceView * null_srv[1] = { nullptr };
+	m_context->PSSetShaderResources(0, 1, null_srv);
+	m_context->VSSetShader(m_vertexShader, nullptr, 0);
+	m_context->PSSetShader(m_pixelShader, nullptr, 0);
+	m_context->PSSetConstantBuffers(0, 1, &m_combinerBuffer);
+	m_context->PSSetConstantBuffers(1, 1, &m_fogBuffer);
+	m_context->PSSetConstantBuffers(2, 1, &m_texgenBuffer);
+	back->Release();
+}
+
 void D3D11Backend::Draw_Screen_Filter_Quad(const RenderBackendFilterQuad & quad)
 {
+	// W3DNext D3D11: the screen-filter (post-process / FOW-reveal / flash) path
+	// draws a full-screen WHITE overlay on some state changes (e.g. toggling
+	// Graphics Detail Low<->High) - confirmed as the white-flash/halo source
+	// (diag modes 2/4 disabling it removed the artifact). The core shroud
+	// darkening is done by the terrain shader, not this quad, so skipping it
+	// only drops cosmetic post-process. Until reworked, skip it by default;
+	// set W3DNEXT_D3D11_FILTERS=1 to re-enable for testing.
+	if (g_w3dnextDiagMode == 2 || g_w3dnextDiagMode == 4) {
+		return;
+	}
+	static int s_filtersEnabled = -1;
+	static bool s_logged = false;
+	if (s_filtersEnabled < 0) {
+		const char * e = W3DNext_GetEnv("W3DNEXT_D3D11_FILTERS");
+		s_filtersEnabled = (e != nullptr && e[0] == '1') ? 1 : 0;
+	}
+	if (s_filtersEnabled == 0) {
+		if (!s_logged) {
+			D3D11_Log_Line("[D3D11] screen-filter quads disabled (set W3DNEXT_D3D11_FILTERS=1 to enable)");
+			s_logged = true;
+		}
+		return;
+	}
 	const unsigned int kMaxVerts = 8;
 	if (!m_pipelineReady || m_context == nullptr || quad.verts == nullptr) {
 		return;
@@ -2833,6 +4132,12 @@ void D3D11Backend::Draw_Screen_Filter_Quad(const RenderBackendFilterQuad & quad)
 	if (quad.vertex_count < 3 || quad.vertex_count > kMaxVerts || quad.uv_sets < 1 || quad.uv_sets > 2) {
 		return;
 	}
+	// W3DNext: force the fixed-function pipeline for this full-screen filter quad.
+	// Otherwise, if a unit/normal-mapped draw left m_unitNormalIsActive true, this
+	// post-process quad would be drawn with the unit-normal shader and produce
+	// rainbow artifacts (observed on FOW/radar reveal over normal-mapped buildings;
+	// diag mode 2 / screen-filter-off removed it, confirming the source).
+	Set_Unit_Normal_Pixel_Shader(false);
 	if (quad.use_captured_scene && m_captureSRV == nullptr) {
 		D3D11_TRACE_NOOP("no-op: no captured backbuffer for filter quad");
 		return;
@@ -2979,6 +4284,7 @@ void D3D11Backend::Draw_Screen_Filter_Quad(const RenderBackendFilterQuad & quad)
 
 	m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 	m_context->DrawIndexed(quad.vertex_count, 0, 0);
+	Mark_Draw_Complete();
 
 	// 5) Restore. The blend/depth vector is left for the next Set_Shader (every
 	// engine draw path re-establishes it); stage-0 SRV/sampler rebind so the
@@ -2997,21 +4303,138 @@ void D3D11Backend::Draw_Screen_Filter_Quad(const RenderBackendFilterQuad & quad)
 	m_fogDirty = true;
 }
 
+// W3DNext D3D11 render-to-texture: water reflection (W3DWater) and projected
+// shadows (W3DProjectedShadow) build their targets via Create_Render_Target and
+// sample them directly. The D3D11 backend owns the real D3D11 textures keyed by
+// the returned TextureClass*; Set_Texture (D3D11Backend_W3D.cpp) detects these and
+// binds the pre-made SRV so the scene samples the reflection/shadow, not null.
+static DXGI_FORMAT WW3DFormat_To_DXGI(WW3DFormat fmt)
+{
+	switch (fmt) {
+	case WW3D_FORMAT_A8R8G8B8:
+	case WW3D_FORMAT_X8R8G8B8:
+	case WW3D_FORMAT_R8G8B8:
+		return DXGI_FORMAT_B8G8R8A8_UNORM;
+	case WW3D_FORMAT_A4R4G4B4:
+	case WW3D_FORMAT_X4R4G4B4:
+		return DXGI_FORMAT_B4G4R4A4_UNORM;
+	case WW3D_FORMAT_A1R5G5B5:
+	case WW3D_FORMAT_X1R5G5B5:
+		return DXGI_FORMAT_B5G5R5A1_UNORM;
+	case WW3D_FORMAT_R5G6B5:
+		return DXGI_FORMAT_B5G6R5_UNORM;
+	case WW3D_FORMAT_A8:
+		return DXGI_FORMAT_A8_UNORM;
+	case WW3D_FORMAT_L8:
+		return DXGI_FORMAT_R8_UNORM;
+	case WW3D_FORMAT_A8L8:
+		return DXGI_FORMAT_R8G8_UNORM;
+	default:
+		return DXGI_FORMAT_B8G8R8A8_UNORM;
+	}
+}
+
 TextureClass * D3D11Backend::Create_Render_Target(int width, int height, WW3DFormat format)
 {
-	D3D11_STUB();
-	return nullptr;
+	if (m_device == nullptr || m_context == nullptr) return nullptr;
+	if (width <= 0) width = 1;
+	if (height <= 0) height = 1;
+
+	DXGI_FORMAT fmt = WW3DFormat_To_DXGI(format);
+
+	RTTTarget t;
+	t.width = (unsigned int)width;
+	t.height = (unsigned int)height;
+	t.tex = nullptr;
+	t.rtv = nullptr;
+	t.srv = nullptr;
+	t.sampler = nullptr;
+	t.depthTex = nullptr;
+	t.dsv = nullptr;
+
+	D3D11_TEXTURE2D_DESC cd = {};
+	cd.Width = t.width;
+	cd.Height = t.height;
+	cd.MipLevels = 1;
+	cd.ArraySize = 1;
+	cd.Format = fmt;
+	cd.SampleDesc.Count = 1;
+	cd.SampleDesc.Quality = 0;
+	cd.Usage = D3D11_USAGE_DEFAULT;
+	cd.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+	cd.CPUAccessFlags = 0;
+	cd.MiscFlags = 0;
+	if (FAILED(m_device->CreateTexture2D(&cd, nullptr, &t.tex))) return nullptr;
+	if (FAILED(m_device->CreateRenderTargetView(t.tex, nullptr, &t.rtv))) { Safe_Release(t.tex); return nullptr; }
+	if (FAILED(m_device->CreateShaderResourceView(t.tex, nullptr, &t.srv))) { Safe_Release(t.rtv); Safe_Release(t.tex); return nullptr; }
+
+	// Own depth-stencil, sized to the render target.
+	D3D11_TEXTURE2D_DESC dd = cd;
+	dd.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+	dd.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+	if (FAILED(m_device->CreateTexture2D(&dd, nullptr, &t.depthTex))) { Safe_Release(t.srv); Safe_Release(t.rtv); Safe_Release(t.tex); return nullptr; }
+	if (FAILED(m_device->CreateDepthStencilView(t.depthTex, nullptr, &t.dsv))) {
+		Safe_Release(t.depthTex); Safe_Release(t.srv); Safe_Release(t.rtv); Safe_Release(t.tex); return nullptr;
+	}
+
+	// Linear + clamp sampler (matches the scene-capture sampling state).
+	D3D11_SAMPLER_DESC sd = {};
+	sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+	sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+	sd.MaxAnisotropy = 1;
+	sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+	sd.MaxLOD = D3D11_FLOAT32_MAX;
+	if (FAILED(m_device->CreateSamplerState(&sd, &t.sampler))) {
+		Safe_Release(t.dsv); Safe_Release(t.depthTex); Safe_Release(t.srv); Safe_Release(t.rtv); Safe_Release(t.tex); return nullptr;
+	}
+
+	// Wrap in a TextureClass so the engine can hold it as a normal texture handle.
+	// The DX8 surface inside is unused (we bind the D3D11 SRV directly); we key on
+	// the TextureClass* in m_rtt so Set_Texture routes sampling to the real RT.
+	TextureClass * tc = NEW_REF(TextureClass, (width, height, format, MIP_LEVELS_1, TextureClass::POOL_DEFAULT, true));
+	if (tc == nullptr) {
+		Safe_Release(t.sampler); Safe_Release(t.dsv); Safe_Release(t.depthTex);
+		Safe_Release(t.srv); Safe_Release(t.rtv); Safe_Release(t.tex);
+		return nullptr;
+	}
+
+	m_rtt[tc] = t;
+	D3D11_Log_Line("[D3D11 RTT] created render target");
+	return tc;
 }
 
 void D3D11Backend::Set_Render_Target_With_Z(TextureClass * texture, ZTextureClass * ztexture)
 {
-	D3D11_STUB();
+	(void)ztexture;
+	if (m_context == nullptr) return;
+	if (texture == nullptr) {            // restore the main backbuffer
+		Bind_Back_Buffer_Targets();
+		m_savedBackBufferRTV = nullptr;
+		return;
+	}
+	auto it = m_rtt.find(texture);
+	if (it == m_rtt.end()) {             // not one of our RTs: fall back to backbuffer
+		Bind_Back_Buffer_Targets();
+		return;
+	}
+	const RTTTarget & t = it->second;
+	m_context->OMSetRenderTargets(1, &t.rtv, t.dsv);
+	m_currentRTV = t.rtv;
+	m_currentDSV = t.dsv;
+	D3D11_VIEWPORT vp;
+	vp.TopLeftX = 0.0f;
+	vp.TopLeftY = 0.0f;
+	vp.Width = (float)t.width;
+	vp.Height = (float)t.height;
+	vp.MinDepth = 0.0f;
+	vp.MaxDepth = 1.0f;
+	m_context->RSSetViewports(1, &vp);
+	m_savedBackBufferRTV = m_backBufferRTV; // mark "in RTT"
 }
 
 bool D3D11Backend::Is_Render_To_Texture()
 {
-	D3D11_STUB();
-	return false;
+	return m_savedBackBufferRTV != nullptr;
 }
 
 void D3D11Backend::Set_Shadow_Map(int idx, ZTextureClass * ztex)

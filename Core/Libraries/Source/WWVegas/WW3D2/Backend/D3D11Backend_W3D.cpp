@@ -38,6 +38,7 @@
 
 #include "D3D11Backend.h"
 
+#include <d3d11.h>           // full ID3D11DeviceContext def (RTT SRV bind in Set_Texture)
 #include "RenderBackend.h"   // Is_D3D11_Backend_Active (copy-shadow gate)
 #include "dx8wrapper.h"      // BUFFER_TYPE_* enum
 #include "dx8fvf.h"          // FVFInfoClass (+ transitively <d3d8.h>)
@@ -349,6 +350,16 @@ void D3D11_Evict_Cached_Texture(unsigned texture_id)
 	static_cast<D3D11Backend *>(g_renderBackend)->Evict_Cached_Texture(texture_id);
 }
 
+// W3DNext: drop a dying render-target texture's D3D11 resources (mirror of the
+// uploaded-texture eviction above) so a recreated RT gets a fresh m_rtt entry.
+void D3D11_Evict_Render_Target(TextureBaseClass * tex)
+{
+	if (!Is_D3D11_Backend_Active()) {
+		return;
+	}
+	static_cast<D3D11Backend *>(g_renderBackend)->Evict_Render_Target(tex);
+}
+
 // The _Copy_DX8_Rects mirror (declared in dx8wrapper.h). Records the copied
 // bytes CPU-side for destinations that can't be read back at bind time. Runs
 // AFTER the real CopyRects; no-op on the default DX8 backend.
@@ -616,6 +627,19 @@ void D3D11Backend::Set_Shader(const ShaderClass & shader)
 	// DX8Wrapper::Get_Render_State and re-applies them at flush time.
 	DX8Wrapper::Set_Shader(shader);
 
+	// Fixed-function (combiner) shader request: the terrain-normal pixel shader
+	// is bound eagerly (PSSetShader) and stays bound until explicitly released.
+	// Decal/projected shadows (and any other FF draw) set their shader through
+	// this path WITHOUT going through W3DShaderManager::setShader, so the leak
+	// guard there never fires for them. If the terrain-normal shader is still
+	// active, drop it back to the FF combiner so shadows/decals render with the
+	// correct alpha blend instead of the opaque normal shader (black square
+	// corners + flicker). Safe for the terrain pass itself: that path re-binds
+	// the normal shader via Set_Terrain_Normal_Pixel_Shader AFTER any Set_Shader.
+	if (m_terrainNormalIsActive) {
+		Set_Terrain_Normal_Pixel_Shader(false);
+	}
+
 	ShaderClass & s = const_cast<ShaderClass &>(shader);
 	m_lastShaderBits = s.Get_Bits();
 
@@ -658,10 +682,34 @@ void D3D11Backend::Set_Shader(const ShaderClass & shader)
 	// Texturing -> single-stage TEXTURE*DIFFUSE modulate (the game's default 2D /
 	// prelit-diffuse combiner). Untextured shaders pass the vertex diffuse through.
 	if (s.Get_Texturing() == ShaderClass::TEXTURING_ENABLE) {
-		Set_Texture_Stage_Count(1);
+		// When the unit-normal pipeline is active we borrow stage 1 for the normal
+		// map. The sorting renderer re-applies textures at flush time up to the
+		// shader's stage count, so a count of 1 would leave stage 1 unbound (the
+		// pink neutral fallback) on units that have no native stage-1 detail layer.
+		// Bumping the count to 2 makes the flush re-bind the normal map we pinned
+		// in textures[1]; the custom pixel shader ignores the FF combiner result,
+		// so enabling stage 1 only affects which SRV slot survives to draw time.
+		// The unit-normal pipeline borrows stage 1 for the normal map. The stage
+		// count here reads the backend sticky flag m_unitNormalIsActive. That flag
+		// is (a) cleared to false at the top of every category
+		// (dx8renderer.cpp:1692) so it is false at insert time for non-unit
+		// categories, and (b) re-driven PER polygon by the sort flush
+		// (sortingrenderer.cpp:378) via Set_Unit_Normal_Pixel_Shader(render_state.
+		// UnitNormalEnable) just before this Set_Shader runs. That per-task re-drive
+		// is what stops a stale "true" from one category leaking into terrain/
+		// water/shroud and baking count 2 (which MODULATEs the category's stage-1
+		// texture into colour -> the rainbow/black halo). The count is re-baked by
+		// the insert-time Set_Shader re-issue in the unit branch.
+		const unsigned int unitCount = (m_unitNormalIsActive ? 2u : 1u);
+		Set_Texture_Stage_Count(unitCount);
 		Set_Texture_Stage_ColorOp(0, RB_TEXOP_MODULATE, RB_TEXARG_TEXTURE, RB_TEXARG_DIFFUSE);
 		Set_Texture_Stage_AlphaOp(0, RB_TEXOP_MODULATE, RB_TEXARG_TEXTURE, RB_TEXARG_DIFFUSE);
 		Set_Texture_Stage_TexCoordIndex(0, 0);
+		if (unitCount >= 2) {
+			Set_Texture_Stage_ColorOp(1, RB_TEXOP_MODULATE, RB_TEXARG_TEXTURE, RB_TEXARG_DIFFUSE);
+			Set_Texture_Stage_AlphaOp(1, RB_TEXOP_MODULATE, RB_TEXARG_TEXTURE, RB_TEXARG_DIFFUSE);
+			Set_Texture_Stage_TexCoordIndex(1, 0);
+		}
 	} else {
 		Set_Texture_Stage_Count(0);
 	}
@@ -720,7 +768,32 @@ void D3D11Backend::Set_Texture(unsigned int stage, TextureBaseClass * texture)
 	if (stage >= RB_MAX_TEXTURE_STAGES) {
 		return;
 	}
+	// Timing is opt-in (D3D11_PROFILE=1, see Profiling_Enabled() in
+	// D3D11Backend.cpp/.h). This runs once per texture stage per draw call, so
+	// by default we skip the QueryPerformanceCounter pair entirely rather than
+	// pay it just to fill in a debug stat nobody is reading.
+	const bool profiling = Profiling_Enabled();
+	LARGE_INTEGER st0;
+	if (profiling) { QueryPerformanceCounter(&st0); }
 	m_boundTextures[stage] = texture;
+
+	// Render-to-texture targets (water reflection / projected shadows): bind the
+	// pre-made D3D11 SRV + sampler directly so the scene samples the real RT
+	// instead of the (null) legacy DX8 surface. Early-out before the DX8 upload
+	// path, whose base-texture lookup would otherwise bind neutral-white for
+	// these POOL_DEFAULT render targets.
+	if (texture != nullptr) {
+		auto it = m_rtt.find(texture);
+		if (it != m_rtt.end()) {
+			m_stageNeutral[stage] = false;
+			m_stageSRV[stage] = it->second.srv;
+			m_stageSampler[stage] = it->second.sampler;
+			m_context->PSSetShaderResources(stage, 1, &it->second.srv);
+			m_context->PSSetSamplers(stage, 1, &it->second.sampler);
+			return;
+		}
+	}
+
 	if (texture == nullptr) {
 		// A null bind must not leave the previous draw's SRV live in the slot:
 		// the combiner still samples slot texture whenever the shader's
@@ -735,11 +808,28 @@ void D3D11Backend::Set_Texture(unsigned int stage, TextureBaseClass * texture)
 	}
 	m_stageNeutral[stage] = false;
 
+	// The per-draw texture bind reaches this backend straight from
+	// MaterialPassClass (dx8renderer.cpp:1705 -> g_renderBackend->Set_Texture),
+	// bypassing TextureClass::Apply - whose first act (texture.cpp:936-938) is
+	// the lazy reload `if (!Initialized) Init();`. We therefore must do that
+	// reload ourselves: a detail switch / device reset invalidates textures
+	// (TextureBaseClass::Invalidate releases the D3D8 surface - texture.cpp:199
+	// - leaving Peek_D3D_Base_Texture()==null) and without an Init() nothing
+	// ever recreates the surface, so every bind would fall through to
+	// Bind_Neutral_Texture (white halo) forever. Mirror Apply: repopulate the
+	// D3D8 surface, then drop through to the normal upload path - the
+	// generation bump (Set_D3D_Base_Texture/Poke_Texture) invalidates any stale
+	// cache entry so Store_Cached_Texture refreshes it from the new bytes.
 	IDirect3DBaseTexture8 * base = texture->Peek_D3D_Base_Texture();
+	if (base == nullptr && !texture->Is_Initialized()) {
+		texture->Init();
+		base = texture->Peek_D3D_Base_Texture();
+	}
 	if (base == nullptr) {
-		// Same stale-SRV hazard as the null bind above: the engine considers a
-		// texture bound but there are no bytes to upload yet, so neutral-white
-		// (not the previous draw's texture) is what this draw must sample.
+		// Still null: surface not ready (background thumbnail load in flight),
+		// or the texture genuinely has no bytes for this draw. Same stale-SRV
+		// hazard as the null bind above - neutral-white (not the previous
+		// draw's texture) is what this draw must sample.
 		Bind_Neutral_Texture(stage);
 		return;
 	}
@@ -821,6 +911,12 @@ void D3D11Backend::Set_Texture(unsigned int stage, TextureBaseClass * texture)
 	const unsigned int cache_key = texture->Get_ID();
 	const unsigned long long content_version = texture->Get_D3D_Generation();
 	if (cacheable && Bind_Cached_Texture(stage, cache_key, content_version)) {
+		if (profiling) {
+			LARGE_INTEGER st1;
+			QueryPerformanceCounter(&st1);
+			m_dbgSetTexMs += static_cast<double>(st1.QuadPart - st0.QuadPart) /
+				static_cast<double>(m_qpcFreq.QuadPart) * 1000.0;
+		}
 		return;
 	}
 
@@ -839,6 +935,20 @@ void D3D11Backend::Set_Texture(unsigned int stage, TextureBaseClass * texture)
 	const bool isDXT = (desc.Format == D3DFMT_DXT1 || desc.Format == D3DFMT_DXT2 ||
 		desc.Format == D3DFMT_DXT3 || desc.Format == D3DFMT_DXT4 ||
 		desc.Format == D3DFMT_DXT5);
+	// Honor the texture's own U/V address mode on EVERY upload path: clamp
+	// textures (shadow decals, shroud, UI) must not tile. World-aligned shadow
+	// decal UVs intentionally exceed [0,1] and relied on the DX8 texture's
+	// TEXTURE_ADDRESS_CLAMP - blanket WRAP repeated the blob as quarter copies
+	// around every shadow quad.
+	bool wrapUV = true;
+	{
+		TextureClass * tcc = texture->As_TextureClass();
+		if (tcc != nullptr
+			&& (tcc->Get_Filter().Get_U_Addr_Mode() == TextureFilterClass::TEXTURE_ADDRESS_CLAMP
+				|| tcc->Get_Filter().Get_V_Addr_Mode() == TextureFilterClass::TEXTURE_ADDRESS_CLAMP)) {
+			wrapUV = false;
+		}
+	}
 	if (isDXT) {
 		bool uploaded = false;
 		// D3D11 requires block-aligned (multiple-of-4, >= 4) top-level dimensions
@@ -905,7 +1015,7 @@ void D3D11Backend::Set_Texture(unsigned int stage, TextureBaseClass * texture)
 					mips[i].row_pitch = static_cast<unsigned int>(extra[i].Pitch);
 					nlev = i + 1;
 				}
-				uploaded = Upload_Texture_BC_Mips(stage, bc, mips, nlev, /*wrap*/true, /*linear*/true, mipf);
+				uploaded = Upload_Texture_BC_Mips(stage, bc, mips, nlev, wrapUV, /*linear*/true, mipf);
 				for (unsigned int i = nlev; i-- > 1; ) {
 					tex->UnlockRect(i);
 				}
@@ -931,6 +1041,7 @@ void D3D11Backend::Set_Texture(unsigned int stage, TextureBaseClass * texture)
 			// the dims are non-block-aligned: bind the neutral WHITE identity so the
 			// draw degrades to a no-op instead of corrupting the pass. Logged.
 			Trace_Texture_Fallback(desc.Format, desc.Width, desc.Height, "DXT lock/upload failed -> neutral white");
+			if (stage == 1) { FILE * fl = fopen("unitnorm.log", "a"); if (fl) { fprintf(fl, "STG1 NEUTRAL bc-fail fmt=%u\n", (unsigned)desc.Format); fclose(fl); } }
 			Bind_Neutral_Texture(stage);
 			Upload_Prof_Account(RB_UPLOAD_FALLBACK, 64, up_t0);
 		}
@@ -946,6 +1057,17 @@ void D3D11Backend::Set_Texture(unsigned int stage, TextureBaseClass * texture)
 	const bool is16 = (desc.Format == D3DFMT_A4R4G4B4 || desc.Format == D3DFMT_R5G6B5 ||
 		desc.Format == D3DFMT_X1R5G5B5 || desc.Format == D3DFMT_A1R5G5B5);
 	if (!is32 && !is16) {
+		{
+			static int s_fbLog = 0;
+			if (s_fbLog < 120) {
+				const char * nm = "(unknown)";
+				if (texture != nullptr) nm = (const char *)texture->Get_Texture_Name();
+				FILE * dbg = fopen("unitnorm.log", "a");
+				if (dbg) { fprintf(dbg, "FALLBACK stage=%u fmt=%u w=%u h=%u tex=%s\n",
+					stage, (unsigned)desc.Format, (unsigned)desc.Width, (unsigned)desc.Height, nm); fclose(dbg); }
+				s_fbLog++;
+			}
+		}
 		Trace_Texture_Fallback(desc.Format, desc.Width, desc.Height, "unhandled format");
 		Upload_Fallback_Texture(stage);
 		Upload_Prof_Account(RB_UPLOAD_FALLBACK, 64, up_t0);
@@ -972,6 +1094,7 @@ void D3D11Backend::Set_Texture(unsigned int stage, TextureBaseClass * texture)
 		// identity renders the multiplying shroud pass as a no-op rather than
 		// painting the whole terrain magenta/black.
 		Trace_Texture_Fallback(desc.Format, desc.Width, desc.Height, "LockRect failed -> neutral white");
+		if (stage == 1) { FILE * fl = fopen("unitnorm.log", "a"); if (fl) { fprintf(fl, "STG1 NEUTRAL lockrect fmt=%u\n", (unsigned)desc.Format); fclose(fl); } }
 		Bind_Neutral_Texture(stage);
 		Upload_Prof_Account(RB_UPLOAD_FALLBACK, 64, up_t0);
 		return;
@@ -1035,7 +1158,7 @@ void D3D11Backend::Set_Texture(unsigned int stage, TextureBaseClass * texture)
 			mips[i].row_pitch = ld.Width * 4;
 			nlev = i + 1;
 		}
-		if (Upload_Texture_RGBA_Mips(stage, mips, nlev, /*wrap*/true, /*linear*/true, mipf) && cacheable) {
+		if (Upload_Texture_RGBA_Mips(stage, mips, nlev, wrapUV, /*linear*/true, mipf) && cacheable) {
 			Store_Cached_Texture(stage, cache_key, content_version);
 		}
 		{

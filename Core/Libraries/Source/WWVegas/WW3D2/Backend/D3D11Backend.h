@@ -37,6 +37,7 @@
 #include "matrix4.h" // Matrix4x4 stored by value for the transform constant buffer
 #include "vector3.h" // Vector3 stored by value (ambient) + typed lighting setters
 #include <map>       // uploaded-texture cache
+#include <vector>     // vertex/index ring buffers
 
 // D3D11 interfaces are forward-declared so this header stays as light as its
 // Backend/ siblings; d3d11.h is included by D3D11Backend.cpp only.
@@ -57,6 +58,11 @@ struct ID3D11Texture2D;
 struct ID3D11ShaderResourceView;
 struct ID3D11SamplerState;
 struct ID3D11Query;
+
+// Defined in D3D11Backend.cpp. Gates the optional per-draw/per-texture-bind/
+// per-upload QueryPerformanceCounter debug timing (off by default - set env
+// D3D11_PROFILE=1 to enable). See the definition for why this exists.
+bool Profiling_Enabled();
 
 class D3D11Backend : public IRenderBackend
 {
@@ -81,6 +87,8 @@ public:
 	ID3D11Device * Get_Device() const { return m_device; }
 	ID3D11DeviceContext * Get_Context() const { return m_context; }
 	IDXGISwapChain * Get_Swap_Chain() const { return m_swapChain; }
+	unsigned int Get_Viewport_Width() const { return m_viewportWidth; }
+	unsigned int Get_Viewport_Height() const { return m_viewportHeight; }
 
 	// Backend-specific direct-upload path (RENDERER_PORT.md step 4). The
 	// IRenderBackend Set_Vertex_Buffer/Set_Index_Buffer overloads take W3D
@@ -93,6 +101,18 @@ public:
 	// into the VB/IB classes. Return false (and leave nothing bound) on failure.
 	bool Upload_Vertices(const void * data, unsigned int size_bytes, unsigned int fvf);
 	bool Upload_Indices16(const unsigned short * indices, unsigned int count);
+	// Issues a GPU-completion fence for the buffers used by the just-issued draw
+	// so the upload pool can safely reuse them (only after the fence signals).
+	void Mark_Draw_Complete();
+
+	// Releases every pooled dynamic vertex/index buffer. Called at Begin_Scene:
+	// by then the previous frame's GPU work is done, so releasing is safe and
+	// memory stays bounded (no per-upload leak, no in-flight reuse -> no TDR/AV).
+	void Flush_Dynamic_Pools();
+
+	// Grow (or create) the single per-frame DEFAULT staging buffer if needed.
+	bool Ensure_Dyn_VB_Cap(unsigned int need);
+	bool Ensure_Dyn_IB_Cap(unsigned int need);
 
 	// Number of texture stages the combiner ubershader supports simultaneously.
 	// N=2 covers the common game case (single/dual-texture); structured to 4.
@@ -211,6 +231,10 @@ public:
 	void Store_Cached_Texture(unsigned int stage, unsigned int key, unsigned long long version);
 	void Evict_Cached_Texture(unsigned int key);
 	void Release_Texture_Cache();
+	// Drop a render-target texture's D3D11 resources when its TextureClass dies
+	// (settings change / map reload recreates the RT). Keyed by the same
+	// TextureClass* the engine holds, so the lookup matches Create_Render_Target.
+	void Evict_Render_Target(TextureBaseClass * tex);
 	unsigned int Peek_Texture_Cache_Hits() const { return m_texCacheHits; }
 	unsigned int Peek_Texture_Cache_Uploads() const { return m_texCacheUploads; }
 
@@ -248,6 +272,44 @@ public:
 	// dot(rgb, lum) with the DX8 trick's effective Rec.601-style weights,
 	// alpha passes through. Sticky until cleared - callers bracket the draw.
 	void Set_Grayscale_Override(bool enable);
+
+	// Clean D3D11 terrain normal-mapping path. When enabled, the next draws use
+	// the terrain HLSL pixel shader (kTerrainNormalPixelShaderHLSL) instead of the
+	// FF combiner, with SunDir/SunColor/Ambient/flags supplied via
+	// Set_Terrain_Normal_Constants. Textures (base/normal/lightmap) are bound
+	// through the normal Set_Texture stage path (t0/t1/t2). Inert until called.
+	void Set_Terrain_Normal_Pixel_Shader(bool enable);
+	void Set_Terrain_Normal_Blend_Pixel_Shader(bool enable);
+	void Set_Terrain_Normal_Constants(const Vector3 & sunDir, const Vector3 & sunColor,
+	                                  const Vector3 & ambient, bool useLightMap);
+	bool Is_Terrain_Normal_Active() const { return m_terrainNormalIsActive; }
+	bool Is_Grade_Enabled() const { return m_gradeEnabled; }
+	void Apply_Color_Grade();
+	void Set_Sun_Screen(float x, float y, float intensity);
+
+	// Clean D3D11 unit/model normal-mapping path (mirrors the terrain normal
+	// path). When enabled, the next unit draws use the unit HLSL vertex+pixel
+	// shaders (kUnitNormalVertexShaderHLSL / kUnitNormalPixelShaderHLSL) instead
+	// of the FF pipeline, with Blinn-Phong sun/ambient/specular + tangent-space
+	// normal map supplied via Set_Unit_Normal_Constants. The base color binds to
+	// t0 and the normal map to t1 through the normal Set_Texture path. Inert
+	// until called - the unit renderer enables it per mesh that has a normal map.
+	void Set_Unit_Normal_Pixel_Shader(bool enable, float detailStrength = 0.0f, float secondaryAdd = 0.0f);
+	void Set_Unit_Normal_Constants(const Vector3 & sunDir, const Vector3 & sunColor,
+	                               const Vector3 & ambient, float detailStrength = 0.0f, float secondaryAdd = 0.0f);
+
+	// Clean D3D11 water reflection/surface pixel shader. When enabled, the next
+	// water draw uses kWaterPixelShaderHLSL (sun glint + planar reflection sampled
+	// from the reflection RTT) instead of the FF combiner. Textures are bound by the
+	// caller via Set_Texture (t0=watermap, t1=reflection RTT, t2=noise); sun direction,
+	// bump strength, reflection factor, glitter and a time value ride in cbWater from
+	// Set_Water_Constants. The FF combiner (m_combinerBuffer) is restored on disable so
+	// terrain/unit/UI draws are untouched. Enabled/restored around each water draw in
+	// W3DWater.cpp.
+	void Set_Water_Pixel_Shader(bool enable);
+	void Set_Water_Constants(const Vector3 & sunDir, const Vector3 & sunColor,
+	                         float bumpScale, float reflectionFactor, float sunGlitter,
+	                         float time, unsigned viewportW, unsigned viewportH);
 
 	// Fixed-function texcoord generation (the D3D8 D3DTSS_TCI_CAMERASPACEPOSITION
 	// + D3DTS_TEXTUREn texture-matrix slice the terrain shroud/cloud passes use).
@@ -331,9 +393,14 @@ public:
 	// no raw D3D state enum crosses the backend boundary. The common ShaderClass
 	// cases: opaque (blend off, ONE/ZERO), alpha blend (SRCALPHA/INVSRCALPHA, Z-write
 	// off), additive (ONE/ONE).
-	void Set_Blend_Enable(bool enable);
-	void Set_Blend_Func(RenderBackendBlendFactor src, RenderBackendBlendFactor dst);
+void Set_Blend_Enable(bool enable);
+void Set_Blend_Func(RenderBackendBlendFactor src, RenderBackendBlendFactor dst);
+	void Set_Raw_Blend_Enable(unsigned int enable) override;
+	void Set_Raw_Src_Blend(unsigned int d3dblend) override;
+	void Set_Raw_Dst_Blend(unsigned int d3dblend) override;
+	void Set_Raw_Stencil(unsigned int d3drs, unsigned int value) override;
 	void Set_Blend_Op(RenderBackendBlendOp op);
+	void Set_Color_Write_Enable(unsigned int mask);
 	void Set_Depth_Test_Enable(bool enable);
 	void Set_Depth_Write_Enable(bool enable);
 	void Set_Depth_Func(RenderBackendCmpFunc func);
@@ -495,7 +562,7 @@ private:
 	// timestamps are live this frame. RB_GPUPROF_RING = 8 frames of latency
 	// budget - a timestamp result 8 flips old is always ready in practice, and
 	// a slot still unresolved when the ring wraps is dropped, never waited on.
-	enum { RB_GPUPROF_MAX_MARKS = 24, RB_GPUPROF_RING = 8, RB_GPUPROF_MAX_SPANS = 16, RB_GPUPROF_EMIT_FRAMES = 300 };
+	enum { RB_GPUPROF_MAX_MARKS = 48, RB_GPUPROF_RING = 8, RB_GPUPROF_MAX_SPANS = 64, RB_GPUPROF_EMIT_FRAMES = 50 };
 	struct GpuProfFrame {
 		ID3D11Query * disjoint;
 		ID3D11Query * ts[RB_GPUPROF_MAX_MARKS];
@@ -586,13 +653,60 @@ private:
 	long m_initResult; // HRESULT of the last Initialize attempt
 	bool m_deviceRemoved; // Present() returned DEVICE_REMOVED/RESET; surfaced via Is_Device_Lost()
 
-	// Geometry + pipeline objects (steps 4/5).
-	ID3D11Buffer * m_vertexBuffer;
+	// Vertex/index data streams through a POOL of reusable DYNAMIC buffers. Each
+	// buffer carries a GPU completion fence (D3D11_QUERY_EVENT); a buffer is only
+	// reused (Map WRITE_DISCARD) once its fence has signalled, so a draw still in
+	// flight never has its data overwritten. That corruption was causing GPU
+	// hangs (TDR -> device removed). This also removes the per-upload IMMUTABLE
+	// buffer allocation that tanked FPS (30 -> 2). Input layouts are cached per FVF.
+	// Single DEFAULT vertex/index buffer re-used for the whole frame. Each
+	// Upload_Vertices / Upload_Indices16 suballocates a disjoint slice via
+	// UpdateSubresource(dst-box) at an advancing offset. CreateBuffer runs ONCE
+	// per frame (not once per upload), and the buffer is released at the next
+	// Begin_Scene (by then the prior frame's GPU work is done) so no slice is
+	// ever overwritten while in flight - that was the Intel AV we hit with
+	// per-upload buffers and with DYNAMIC+Map (TDR).
+	ID3D11Buffer * m_vertexBuffer;   // current pool slot bound for the next draw
+	unsigned int m_vertexFVF;         // FVF of the last uploaded/bound VB
+	unsigned int m_unitNormalFVF;     // FVF captured on the first draw after
+	                                  // Set_Unit_Normal_Pixel_Shader(true). Any later
+	                                  // draw whose FVF differs (e.g. a shadow/decal
+	                                  // quad that inherited the bound unit-normal
+	                                  // pipeline) is force-reset to the FF combiner.
 	ID3D11Buffer * m_indexBuffer;
+	ID3D11Buffer * m_dynVB;          // frame vertex staging buffer (DEFAULT)
+	unsigned int m_dynVBOffset;      // next free byte offset
+	unsigned int m_dynVBCap;         // allocated capacity
+	ID3D11Buffer * m_dynIB;          // frame index staging buffer (DEFAULT)
+	unsigned int m_dynIBOffset;
+	unsigned int m_dynIBCap;
 	ID3D11Buffer * m_constantBuffer; // cbPerObject { row_major float4x4 WVP }
-	ID3D11InputLayout * m_inputLayout;
+	std::map<unsigned int, ID3D11InputLayout *> m_inputLayoutCache;
 	ID3D11VertexShader * m_vertexShader;
 	ID3D11PixelShader * m_pixelShader;
+	ID3D11PixelShader * m_terrainNormalPixelShader; // clean D3D11 terrain normal path (inert until enabled)
+	ID3D11PixelShader * m_terrainNormalBlendPixelShader; // terrain normal BLEND (edge crossfade) variant
+	ID3D11Buffer * m_terrainBuffer;                 // cbTerrain (pixel-shader register b0)
+	bool m_terrainNormalIsActive;                  // tracks terrain-normal pipeline state so the unit-normal hook can skip terrain
+	ID3D11PixelShader * m_gradePixelShader;         // W3DNext color-grade post-process (inert until enabled)
+	ID3D11VertexShader * m_gradeVertexShader;
+	ID3D11Buffer * m_gradeBuffer;                   // cbGrade (pixel-shader register b0)
+	ID3D11Texture2D * m_gradeTexture;               // off-screen copy of the finished frame
+	ID3D11ShaderResourceView * m_gradeSRV;
+	ID3D11SamplerState * m_gradeSampler;
+	unsigned int m_gradeWidth;                      // current grade-texture size (recreated on resize)
+	unsigned int m_gradeHeight;
+bool m_gradeEnabled;                            // master switch (W3DNEXT_GRADE=0 disables)
+	bool m_gradeNightVision;                        // F6: green NV-goggle filter (needs grade pass on)
+	float m_sunScreen[3];                           // god rays: sun screen uv + intensity (0 = off this frame)
+	ID3D11VertexShader * m_unitNormalVertexShader;  // clean D3D11 unit normal path (inert until enabled)
+	ID3D11PixelShader * m_unitNormalPixelShader;    // clean D3D11 unit normal path (inert until enabled)
+	ID3D11Buffer * m_unitBuffer;                    // cbUnit (pixel-shader register b0)
+	bool m_unitNormalIsActive;                      // tracks unit-normal pipeline state to avoid per-category thrash
+	float m_unitLastDetail;                         // last detailStrength passed to Set_Unit_Normal_Constants
+	float m_unitLastSecondary;                      // last secondaryAdd passed to Set_Unit_Normal_Constants
+	ID3D11PixelShader * m_waterPixelShader;         // clean D3D11 water reflection/surface shader (inert until enabled)
+	ID3D11Buffer * m_waterBuffer;                   // cbWater (pixel-shader register b0)
 	ID3D11RasterizerState * m_rasterizerState;
 
 	// Compiled VS bytecode, retained because CreateInputLayout validates the
@@ -628,6 +742,7 @@ private:
 	ID3D11ShaderResourceView * m_stageSRV[RB_MAX_TEXTURE_STAGES];
 	ID3D11SamplerState * m_stageSampler[RB_MAX_TEXTURE_STAGES];
 	TextureBaseClass * m_boundTextures[RB_MAX_TEXTURE_STAGES];
+	unsigned long long m_boundTexGen[RB_MAX_TEXTURE_STAGES]; // generation of the bound texture (early-out check)
 	bool m_stageNeutral[RB_MAX_TEXTURE_STAGES]; // slot holds the neutral-white fallback (null Set_Texture)
 
 	// The shared neutral-white object behind Bind_Neutral_Texture. Device
@@ -655,6 +770,27 @@ private:
 	unsigned int m_texCacheHits;
 	unsigned int m_texCacheUploads;
 	unsigned int m_texCacheEvictions;
+
+	unsigned int m_frameDrawCalls; // draws issued this frame (reset at End_Scene)
+
+	// Last-bound OM/RS state objects, so Apply_Render_State_Changes can skip the
+	// (expensive on Intel) OMSet*/RSSet* calls when the state did not change.
+	ID3D11BlendState * m_lastBlendState;
+	ID3D11DepthStencilState * m_lastDepthState;
+	unsigned int m_lastStencilRef;                  // stencil ref is an OMSet arg, part of the flush key
+	ID3D11RasterizerState * m_lastRasterState;
+
+	LARGE_INTEGER m_frameStartT; // Begin_Scene QPC timestamp (render-submit timing)
+
+	// Per-draw hot-path timing accumulators (diagnostic, printed in [frame]).
+	double m_dbgApplyMs;
+	double m_dbgConstMs;
+	double m_dbgOtherMs;
+	double m_dbgDrawMs;
+	double m_dbgSetTexMs;
+	double m_dbgUploadMs;       // Upload_Vertices / Upload_Indices16 cost
+	unsigned int m_dbgUploads;  // dynamic buffer uploads this frame
+	LARGE_INTEGER m_qpcFreq;
 
 	// Flip-frame counter, incremented once per End_Scene(flip_frame) present. The
 	// framedump and the texcache counter line both key off it, so a dumped fNNN
@@ -691,6 +827,24 @@ private:
 	ID3D11Texture2D * m_captureTexture;
 	ID3D11ShaderResourceView * m_captureSRV;
 	ID3D11SamplerState * m_captureSampler;
+
+	// --- Render-to-texture (W3DNext D3D11): water reflection + projected shadows.
+	// Keyed by the TextureClass* returned to the engine; Set_Texture detects these
+	// so the real D3D11 SRV is sampled instead of the (null) legacy DX8 surface.
+	struct RTTTarget
+	{
+		ID3D11Texture2D *          tex;
+		ID3D11RenderTargetView *   rtv;
+		ID3D11ShaderResourceView * srv;
+		ID3D11SamplerState *       sampler;
+		ID3D11Texture2D *          depthTex;
+		ID3D11DepthStencilView *   dsv;
+		unsigned int               width, height;
+	};
+	std::map<TextureBaseClass *, RTTTarget> m_rtt;
+	ID3D11RenderTargetView * m_savedBackBufferRTV; // non-null == currently rendering to an RT
+	ID3D11RenderTargetView * m_currentRTV; // actually-bound RTV (backbuffer or an RTT)
+	ID3D11DepthStencilView * m_currentDSV; // actually-bound DSV (mirrors m_currentRTV)
 
 	// Diagnostics only (W3DNEXT_D3D11_DRAWLOG): the last ShaderClass word mirrored by
 	// Set_Shader and the D3D8 format of each bound stage texture, so the per-draw

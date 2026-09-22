@@ -132,6 +132,7 @@ TextureBaseClass::~TextureBaseClass()
 	// texture ids are never reused, so a MISSED eviction can only leak, never
 	// alias onto a later texture (no-op on the DX8 backend).
 	D3D11_Evict_Cached_Texture(texture_id);
+	D3D11_Evict_Render_Target(this);
 
 	DX8TextureManagerClass::Remove(this);
 }

@@ -62,6 +62,21 @@ enum RenderBackendBlendFactor
 	RB_BLEND_FACTOR_COUNT
 };
 
+// Stencil operation (D3DRS_STENCILFAIL/ZFAIL/PASS / D3D11_STENCIL_OP).
+// Values are sequential and do NOT match D3DSTENCILOP_*.
+enum RenderBackendStencilOp
+{
+	RB_STENCILOP_KEEP = 0,
+	RB_STENCILOP_ZERO,
+	RB_STENCILOP_REPLACE,
+	RB_STENCILOP_INCRSAT,
+	RB_STENCILOP_DECRSAT,
+	RB_STENCILOP_INVERT,
+	RB_STENCILOP_INCR,
+	RB_STENCILOP_DECR,
+	RB_STENCILOP_COUNT
+};
+
 // Blend equation (D3DRS_BLENDOP / D3D11_BLEND_OP). ADD covers every game case;
 // the rest are supported for completeness.
 enum RenderBackendBlendOp
@@ -118,11 +133,36 @@ struct RenderStateVector
 	RenderBackendBlendFactor srcBlend;// D3DRS_SRCBLEND
 	RenderBackendBlendFactor dstBlend;// D3DRS_DESTBLEND
 	RenderBackendBlendOp blendOp;     // D3DRS_BLENDOP
+	unsigned int colorWriteEnable;    // D3DRS_COLORWRITEENABLE (low 4 bits: R,G,B,A)
 
 	// Depth-stencil (OMSetDepthStencilState).
 	bool depthEnable;                 // D3DRS_ZENABLE
 	bool depthWrite;                  // D3DRS_ZWRITEENABLE
 	RenderBackendCmpFunc depthFunc;   // D3DRS_ZFUNC
+
+	// Stencil (OMSetDepthStencilState) - drives the volumetric shadow passes.
+	bool stencilEnable;               // D3DRS_STENCILENABLE
+	RenderBackendCmpFunc stencilFunc; // D3DRS_STENCILFUNC
+	RenderBackendStencilOp stencilFail;  // D3DRS_STENCILFAIL
+	RenderBackendStencilOp stencilZFail; // D3DRS_STENCILZFAIL
+	RenderBackendStencilOp stencilPass;  // D3DRS_STENCILPASS
+	unsigned int stencilRef;             // D3DRS_STENCILREF (OMSetDepthStencilState arg)
+	unsigned int stencilMask;            // D3DRS_STENCILMASK (read mask)
+	unsigned int stencilWriteMask;       // D3DRS_STENCILWRITEMASK
+
+	// Back-face (CCW) stencil ops - D3DRS_TWOSIDEDSTENCILMODE / D3DRS_CCW_STENCIL*.
+	// The stencil-shadow-volume technique fundamentally needs DIFFERENT ops for
+	// front- and back-facing shadow-volume polygons (e.g. increment on back-face
+	// depth-fail, decrement on front-face depth-fail) to count correctly; without
+	// these, D3D11's BackFace descriptor was silently mirrored from FrontFace
+	// (see Get_Depth_State), which breaks the volume count and makes shadows
+	// render as if stuck to the casting object instead of projected onto the
+	// ground.
+	bool twoSidedStencil;                  // D3DRS_TWOSIDEDSTENCILMODE
+	RenderBackendCmpFunc ccwStencilFunc;    // D3DRS_CCW_STENCILFUNC
+	RenderBackendStencilOp ccwStencilFail;  // D3DRS_CCW_STENCILFAIL
+	RenderBackendStencilOp ccwStencilZFail; // D3DRS_CCW_STENCILZFAIL
+	RenderBackendStencilOp ccwStencilPass;  // D3DRS_CCW_STENCILPASS
 
 	// Rasterizer (RSSetState).
 	RenderBackendCullMode cullMode;   // D3DRS_CULLMODE

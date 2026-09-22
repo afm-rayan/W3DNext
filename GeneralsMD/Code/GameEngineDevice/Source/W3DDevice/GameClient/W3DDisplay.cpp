@@ -119,6 +119,7 @@ static void drawFramerateBar();
 #include "WW3D2/meshmdl.h"
 #include "WW3D2/rddesc.h"
 #include "WW3D2/Backend/RenderBackend.h"
+#include "WW3D2/Backend/D3D11Backend.h"
 #include "TARGA.h"
 
 #include "GameLogic/ScriptEngine.h"		// For TheScriptEngine - jkmcd
@@ -2147,6 +2148,16 @@ AGAIN:
 
 				// draw all views of the world
 				drawViews();
+
+				// W3DNext: color grade + god rays AFTER the 3D scene, BEFORE the
+				// 2D UI. The radial march must not sample UI (white buttons/icons
+				// painted halos), and interface elements should not be graded.
+				if (Is_D3D11_Backend_Active()) {
+					D3D11Backend * d3d = static_cast<D3D11Backend *>(g_renderBackend);
+					if (d3d->Is_Grade_Enabled()) {
+						d3d->Apply_Color_Grade();
+					}
+				}
 
 				// GPU profile phase cut: everything from frame begin to here is
 				// the 3D world (terrain markers subdivide it); ui follows.

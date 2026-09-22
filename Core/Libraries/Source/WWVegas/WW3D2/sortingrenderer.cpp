@@ -43,6 +43,7 @@
 #include "dx8indexbuffer.h"
 #include "dx8wrapper.h"
 #include "Backend/RenderBackend.h"
+#include "Backend/D3D11Backend.h"
 #include "vertmaterial.h"
 #include "texture.h"
 #include "d3d8.h"
@@ -367,6 +368,16 @@ void SortingRendererClass::Insert_To_Sorting_Pool(SortingNodeStruct* state)
 
 static void Apply_Render_State(RenderStateStruct& render_state)
 {
+	// The unit-normal pipeline binds a custom pixel shader via a side-channel
+	// (Set_Unit_Normal_Pixel_Shader) that the captured render_state does not
+	// otherwise record. Re-apply it per-polygon so sorted units flush with the
+	// correct shader instead of the FF combiner + the normal map (which would
+	// rainbow). Must run BEFORE Set_Shader so Set_Shader sees the right stage count.
+	if (Is_D3D11_Backend_Active()) {
+		D3D11Backend * backend = static_cast<D3D11Backend *>(g_renderBackend);
+		backend->Set_Unit_Normal_Pixel_Shader(render_state.UnitNormalEnable, 0.0f, 0.0f);
+	}
+
 	g_renderBackend->Set_Shader(render_state.shader);
 
 	g_renderBackend->Set_Material(render_state.material);

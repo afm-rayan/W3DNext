@@ -213,7 +213,10 @@ public:
 	WorldHeightMap *getMap() {return m_map;}	///< returns object holding the heightmap samples - need this for fast access.
 	Bool isClearLineOfSight(const Coord3D& pos, const Coord3D& posOther) const;
 
-	Bool getShowImpassableAreas() {return m_showImpassableAreas;}
+ 	// Check if a terrain tile is culled (not visible) - for frustum culling optimization
+ 	virtual Bool IsTileCulled(Int x, Int y) const { return false; }
+
+ 	Bool getShowImpassableAreas() {return m_showImpassableAreas;}
 	void setShowImpassableAreas(Bool show) {m_showImpassableAreas = show;}
 
 	Bool showAsVisibleCliff(Int xIndex, Int yIndex) const;

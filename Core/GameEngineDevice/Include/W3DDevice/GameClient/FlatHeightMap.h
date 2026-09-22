@@ -90,4 +90,7 @@ protected:
 protected:
 	void releaseTiles();
 
+	// Check if a terrain tile is culled (for frustum culling optimization)
+	virtual Bool IsTileCulled(Int x, Int y) const override;
+
 };

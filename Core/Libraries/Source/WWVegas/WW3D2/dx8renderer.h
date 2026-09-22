@@ -85,6 +85,18 @@ class DX8TextureCategoryClass : public MultiListObjectClass
 	PolyRenderTaskClass *						render_task_head;			// polygon renderers queued for rendering
 	static bool											m_gForceMultiply;  // Forces opaque materials to use the multiply blend - pseudo transparent effect.  jba.
 
+	// Lazy unit/model normal-map hook (D3D11 only). On first render we probe for a
+	// "<base>_n.tga" companion texture; if it loads we keep it and the Render()
+	// path switches that category to the clean HLSL normal-mapping shader.
+	TextureClass *						m_unitNormalMap;
+	bool												m_unitNormalChecked;
+	bool												m_unitCheckedF5;      // F5 state at probe time (cache invalidation)
+
+	// W3DNext: apply/reset unit-normal per mesh (not per category) so the global
+	// pixel shader + UnitNormalEnable flag can't leak into neighbouring meshes
+	// (rocks/buildings turning pink with camera rotation).
+	void												W3DNext_UnitNormal_PerMesh(ShaderClass sh, bool isWorldDiffuse, bool terrainNormalActive);
+
 public:
 
 	DX8TextureCategoryClass(DX8FVFCategoryContainer* container,TextureClass** textures, ShaderClass shd, VertexMaterialClass* mat,int pass);

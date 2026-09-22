@@ -94,6 +94,8 @@ struct DataChunkInfo;
 class TerrainTextureClass;
 class AlphaTerrainTextureClass;
 class AlphaEdgeTextureClass;
+class NormalMapTerrainTextureClass;
+class NormalMapEdgeTextureClass;
 
 #define NUM_ALPHA_TILES 12
 
@@ -104,6 +106,8 @@ class WorldHeightMap : public RefCountClass,
 	friend class AlphaTerrainTextureClass;
 	friend class W3DCustomEdging;
 	friend class AlphaEdgeTextureClass;
+	friend class NormalMapTerrainTextureClass;
+	friend class NormalMapEdgeTextureClass;
 
 #define NO_EVAL_TILING_MODES
 
@@ -159,6 +163,7 @@ protected:
 
 	TileData			*m_sourceTiles[NUM_SOURCE_TILES];	///< Tiles for m_textureClasses
 	TileData			*m_edgeTiles[NUM_SOURCE_TILES];	///< Tiles for m_textureClasses
+	TileData			*m_normalSourceTiles[NUM_SOURCE_TILES];	///< Parallel _n normal-map tiles for m_sourceTiles
 
 	TBlendTileInfo	m_blendedTiles[NUM_BLEND_TILES];
 	TBlendTileInfo	m_extraBlendedTiles[NUM_BLEND_TILES];
@@ -192,6 +197,15 @@ protected:
 	AlphaEdgeTextureClass *m_alphaEdgeTex;
 	Int	m_alphaEdgeHeight; /// Height of m_alphaEdgeTex allocated.
 
+	/** The texture that contains normal-map blend edge tiles. */
+	NormalMapEdgeTextureClass *m_normalEdgeTex;
+	Int	m_normalEdgeHeight; /// Height of m_normalEdgeTex allocated.
+	/** The texture that contains the terrain normal-map tiles. */
+	TextureClass *m_normalTerrainTex;
+	Int	m_normalTerrainTexHeight; /// Height of m_normalTerrainTex allocated.
+	/// True if any normal-map (_n) tiles were loaded successfully.
+	Bool m_hasNormalMap;
+
 	/// Drawing info - re the part of the map that is being drawn.
 	Int m_drawOriginX;
 	Int m_drawOriginY;
@@ -205,11 +219,13 @@ protected:
 protected:
 	TileData *getSourceTile(UnsignedInt ndx) { if (ndx<NUM_SOURCE_TILES) return(m_sourceTiles[ndx]); return(nullptr); };
 	TileData *getEdgeTile(UnsignedInt ndx) { if (ndx<NUM_SOURCE_TILES) return(m_edgeTiles[ndx]); return(nullptr); };
+	TileData *getNormalSourceTile(UnsignedInt ndx) { if (ndx<NUM_SOURCE_TILES) return(m_normalSourceTiles[ndx]); return(nullptr); };
 	/// UV mapping data for a cell to map into the terrain texture.
 	void getUVForNdx(Int ndx, float *minU, float *minV, float *maxU, float*maxV);
 	Bool getUVForTileIndex(Int ndx, Short tileNdx, float U[4], float V[4]);
 	Int getTextureClassFromNdx(Int tileNdx);
 	void readTexClass(TXTextureClass *texClass, TileData **tileData);
+	void readTexClassNormal(TXTextureClass *texClass, TileData **tileData);
 	Int updateTileTexturePositions(Int *edgeHeight); ///< Places each tile in the texture.
 	void initCliffFlagsFromHeights();
 	void setCellCliffFlagFromHeights(Int xIndex, Int yIndex);
@@ -226,6 +242,7 @@ protected:	 // file reader callbacks.
 	static Bool ParseObjectDataChunk(DataChunkInput &file, DataChunkInfo *info, void *userData);
 	Bool ParseObjectData(DataChunkInput &file, DataChunkInfo *info, void *userData, Bool readDict);
 	static Bool ParseLightingDataChunk(DataChunkInput &file, DataChunkInfo *info, void *userData);
+	static Bool readTilesDDS(InputStream *pStr, TileData **tiles, Int numRows);
 
 protected:
 	WorldHeightMap();			///< Simple constructor for WorldHeightMapEdit class.
@@ -286,6 +303,9 @@ public:  // tile and texture info.
 	TextureClass *getTerrainTexture();  //< generates if needed and returns the terrain texture
 	TextureClass *getAlphaTerrainTexture(); //< generates if needed and returns alpha terrain texture
 	TextureClass *getEdgeTerrainTexture(); //< generates if needed and returns blend edge texture
+	TextureClass *getNormalTerrainTexture(void);  //< generates if needed and returns the terrain normal-map texture (NULL if none)
+	TextureClass *getNormalEdgeTerrainTexture(void); //< generates if needed and returns the normal-map blend edge texture
+	Bool hasNormalMap(void) const { return(m_hasNormalMap); }
 	/// UV mapping data for a cell to map into the terrain texture.  Returns true if the textures had to be stretched for cliffs.
 	Bool getUVData(Int xIndex, Int yIndex, float U[4], float V[4]);
 	Bool getFlipState(Int xIndex, Int yIndex) const;

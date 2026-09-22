@@ -2033,6 +2033,31 @@ void HeightMapRenderObjClass::Render(RenderInfoClass & rinfo)
  		W3DShaderManager::setTexture(1,m_stageZeroTexture);
  		W3DShaderManager::setTexture(2,m_stageTwoTexture);	//cloud
  		W3DShaderManager::setTexture(3,m_stageThreeTexture);//noise
+		// W3DNext D3D11 terrain normal-mapping: when a normal map is present and
+		// lightmapping is on, switch to the HLSL terrain normal shader (base on
+		// slot0, normal on slot1, projected lightmap on slot3). Mirrors the
+		// GeneralsModern_PBR routing; D3D11-only so the DX8 backend is untouched.
+		// The night lightmap/ambient are grayscaled inside the HLSL, so this no
+		// longer turns the terrain blue (that was the reason for the old "!).
+		static const bool s_d3d11TerrainNormalEnabled = [] {
+			const char * e = W3DNext_GetEnv("D3D11_TERRAIN_NORMAL");
+			return e == nullptr || e[0] != '0';
+		}();
+		if (Is_D3D11_Backend_Active() && s_d3d11TerrainNormalEnabled
+			&& st != W3DShaderManager::ST_TERRAIN_BASE
+			&& !ShaderClass::Is_Backface_Culling_Inverted()
+			&& m_map && m_map->hasNormalMap() && TheGlobalData->m_useLightMap)
+		{
+			TextureClass *normalTex = m_map->getNormalTerrainTexture();
+			if (normalTex != NULL) {
+				st = W3DShaderManager::ST_TERRAIN_NORMAL;
+				W3DShaderManager::setTexture(1, normalTex);	//normal atlas on slot1
+				// The terrain normal shader is single-pass. devicePasses was computed
+				// from the base shader (NOISE12 == 3 passes) BEFORE this override, so
+				// without this the terrain would be drawn 3x (huge FPS loss on iGPU).
+				devicePasses = W3DShaderManager::getShaderPasses(st); // == 1
+			}
+		}
 		//Disable writes to destination alpha channel (if there is one)
 		if (DX8Wrapper::getBackBufferFormat() == WW3D_FORMAT_A8R8G8B8)
 			DX8Wrapper::Set_DX8_Render_State(D3DRS_COLORWRITEENABLE,D3DCOLORWRITEENABLE_BLUE|D3DCOLORWRITEENABLE_GREEN|D3DCOLORWRITEENABLE_RED);
@@ -2055,6 +2080,9 @@ void HeightMapRenderObjClass::Render(RenderInfoClass & rinfo)
 		for (j=0; j<m_numVBTilesY; j++)
 			for (i=0; i<m_numVBTilesX; i++)
 			{
+			if (IsTileCulled(i, j)) {
+				continue;
+			}
 				g_renderBackend->Set_Vertex_Buffer(getVertexBufferTile(i, j));
 #ifdef PRE_TRANSFORM_VERTEX
 				if (m_xformedVertexBuffer && pass==0) {
@@ -2418,5 +2446,185 @@ void HeightMapRenderObjClass::renderExtraBlendTiles()
 			W3DShaderManager::resetShader(st);
 		}
   }
+}
+
+//=============================================================================
+// Render the 2-way normal-map edge blend (crossfade) as a SEPARATE pass, using
+// WorldHeightMap::getAlphaUVData for the per-corner blend weight (0/255) and the
+// neighbour texture UV -- the same crossfade mechanism the base colour pass uses.
+// The previous DX8 implementation built a hand-made BAND=4 feather that produced
+// a near-constant ~0.45 alpha per cell, causing the serrated/mosaic edges at
+// texture boundaries. This version removes the feather and uses getAlphaUVData
+// directly. The main terrain pass is untouched, so relief is preserved.
+//=============================================================================
+void HeightMapRenderObjClass::renderNormalEdgeBlend()
+{
+	if (!TheGlobalData || !TheGlobalData->m_useLightMap)
+		return;
+	if (!m_map || !m_map->hasNormalMap())
+		return;
+	TextureClass *normalTex = m_map->getNormalTerrainTexture();
+	if (normalTex == NULL)
+		return;
+
+	Int vertexCount = 0;
+	Int indexCount = 0;
+	Int border = m_map->getBorderSizeInline();
+	static Int maxBlendTiles = DEFAULT_MAX_FRAME_EXTRABLEND_TILES;
+	if (maxBlendTiles > 10000)
+		maxBlendTiles = 10000;
+
+	DynamicVBAccessClass vb_access(BUFFER_TYPE_DYNAMIC_DX8, DX8_FVF_XYZNDUV2, maxBlendTiles*4);
+	DynamicIBAccessClass ib_access(BUFFER_TYPE_DYNAMIC_DX8, maxBlendTiles*6);
+	{
+		DynamicVBAccessClass::WriteLockClass lock(&vb_access);
+		VertexFormatXYZNDUV2* vb = lock.Get_Formatted_Vertex_Array();
+		DynamicIBAccessClass::WriteLockClass lockib(&ib_access);
+		UnsignedShort *ib = lockib.Get_Index_Array();
+		if (!vb || !ib) return;
+
+		Int drawEdgeY = m_map->getDrawOrgY()+m_map->getDrawHeight()-1;
+		Int drawEdgeX = m_map->getDrawOrgX()+m_map->getDrawWidth()-1;
+		if (drawEdgeX > (m_map->getXExtent()-1))
+			drawEdgeX = m_map->getXExtent()-1;
+		if (drawEdgeY > (m_map->getYExtent()-1))
+			drawEdgeY = m_map->getYExtent()-1;
+		Int drawStartX = m_map->getDrawOrgX();
+		Int drawStartY = m_map->getDrawOrgY();
+
+		for (Int j=0; j<m_numVBTilesY; j++)
+		{
+			for (Int i=0; i<m_numVBTilesX; i++)
+			{
+				if (vertexCount >= (maxBlendTiles*4))
+					break;
+
+				Int mapX = getXWithOrigin(i);
+				Int mapY = getYWithOrigin(j);
+				Real U[4], V[4];
+				UnsignedByte alpha[4];
+				Bool flipState = false;
+				m_map->getAlphaUVData(mapX, mapY, U, V, alpha, &flipState);
+
+				// Skip tiles with no 2-way blend (all corners alpha 0).
+				if (alpha[0]==0 && alpha[1]==0 && alpha[2]==0 && alpha[3]==0)
+					continue;
+
+				Int xCoord = mapX + drawStartX;
+				Int yCoord = mapY + drawStartY;
+				Real p0 = m_map->getDisplayHeight(mapX, mapY) * MAP_HEIGHT_SCALE;
+				Real p1 = m_map->getDisplayHeight(mapX+1, mapY) * MAP_HEIGHT_SCALE;
+				Real p2 = m_map->getDisplayHeight(mapX+1, mapY+1) * MAP_HEIGHT_SCALE;
+				Real p3 = m_map->getDisplayHeight(mapX, mapY+1) * MAP_HEIGHT_SCALE;
+
+				vb->x=ADJUST_FROM_INDEX_TO_REAL(xCoord);
+				vb->y=ADJUST_FROM_INDEX_TO_REAL(yCoord);
+				vb->z=p0;
+				vb->nx=0; vb->ny=0; vb->nz=0;
+				vb->diffuse=(alpha[0]<<24)|(getStaticDiffuse(mapX, mapY) & 0x00ffffff);
+				vb->u1=0;
+				vb->v1=0;
+				vb->u2=U[0];
+				vb->v2=V[0];
+				vb++;
+
+				vb->x=ADJUST_FROM_INDEX_TO_REAL(xCoord+1);
+				vb->y=ADJUST_FROM_INDEX_TO_REAL(yCoord);
+				vb->z=p1;
+				vb->nx=0; vb->ny=0; vb->nz=0;
+				vb->diffuse=(alpha[1]<<24)|(getStaticDiffuse(mapX+1, mapY) & 0x00ffffff);
+				vb->u1=0;
+				vb->v1=0;
+				vb->u2=U[1];
+				vb->v2=V[1];
+				vb++;
+
+				vb->x=ADJUST_FROM_INDEX_TO_REAL(xCoord+1);
+				vb->y=ADJUST_FROM_INDEX_TO_REAL(yCoord+1);
+				vb->z=p2;
+				vb->nx=0; vb->ny=0; vb->nz=0;
+				vb->diffuse=(alpha[2]<<24)|(getStaticDiffuse(mapX+1, mapY+1) & 0x00ffffff);
+				vb->u1=0;
+				vb->v1=0;
+				vb->u2=U[2];
+				vb->v2=V[2];
+				vb++;
+
+				vb->x=ADJUST_FROM_INDEX_TO_REAL(xCoord);
+				vb->y=ADJUST_FROM_INDEX_TO_REAL(yCoord+1);
+				vb->z=p3;
+				vb->nx=0; vb->ny=0; vb->nz=0;
+				vb->diffuse=(alpha[3]<<24)|(getStaticDiffuse(mapX, mapY+1) & 0x00ffffff);
+				vb->u1=0;
+				vb->v1=0;
+				vb->u2=U[3];
+				vb->v2=V[3];
+				vb++;
+
+				if (flipState)
+				{
+					ib[0]=1+vertexCount;
+					ib[1]=3+vertexCount;
+					ib[2]=0+vertexCount;
+					ib[3]=1+vertexCount;
+					ib[4]=2+vertexCount;
+					ib[5]=3+vertexCount;
+				}
+				else
+				{
+					ib[0]=0+vertexCount;
+					ib[1]=2+vertexCount;
+					ib[2]=3+vertexCount;
+					ib[3]=0+vertexCount;
+					ib[4]=1+vertexCount;
+					ib[5]=2+vertexCount;
+				}
+				ib += 6;
+				vertexCount += 4;
+				indexCount += 6;
+			}
+		}
+	}
+
+	if (vertexCount)
+	{
+		if (vertexCount == (maxBlendTiles*4))
+			maxBlendTiles += 16;
+
+		ShaderClass::Invalidate();
+		g_renderBackend->Set_Index_Buffer(ib_access,0);
+		g_renderBackend->Set_Vertex_Buffer(vb_access);
+		VertexMaterialClass *vmat=VertexMaterialClass::Get_Preset(VertexMaterialClass::PRELIT_DIFFUSE);
+		g_renderBackend->Set_Material(vmat);
+		REF_PTR_RELEASE(vmat);
+
+		// Bind terrain textures for the normal blend shader (same as the main
+		// normal pass): base colour atlas on slot0, normal atlas on slot1,
+		// lightmap on slot3.
+		W3DShaderManager::setTexture(0, m_stageZeroTexture);
+		W3DShaderManager::setTexture(1, normalTex);
+		W3DShaderManager::setTexture(2, m_stageTwoTexture);
+		W3DShaderManager::setTexture(3, m_stageThreeTexture);
+		W3DShaderManager::setShader(W3DShaderManager::ST_TERRAIN_NORMAL_EDGE, 0);
+
+		// Enable alpha blending so the blend tile crossfades with the main
+		// opaque terrain pass underneath (own side transparent, blend side opaque).
+		// Disable the depth TEST so the blend overlay always draws on top of the
+		// main pass at the same depth (z-equal would otherwise be culled by LESS).
+		DX8Wrapper::Set_DX8_Render_State(D3DRS_ZENABLE, FALSE);
+		DX8Wrapper::Set_DX8_Render_State(D3DRS_ZWRITEENABLE, FALSE);
+		DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHABLENDENABLE, TRUE);
+		DX8Wrapper::Set_DX8_Render_State(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+		DX8Wrapper::Set_DX8_Render_State(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+
+		if (Is_Hidden() == 0) {
+			g_renderBackend->Draw_Triangles(0, indexCount/3, 0, vertexCount);
+		}
+
+		DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHABLENDENABLE, FALSE);
+		DX8Wrapper::Set_DX8_Render_State(D3DRS_ZENABLE, TRUE);
+		DX8Wrapper::Set_DX8_Render_State(D3DRS_ZWRITEENABLE, TRUE);
+		W3DShaderManager::resetShader(W3DShaderManager::ST_TERRAIN_NORMAL_EDGE);
+	}
 }
 #endif
