@@ -2469,7 +2469,6 @@ void HeightMapRenderObjClass::renderNormalEdgeBlend()
 
 	Int vertexCount = 0;
 	Int indexCount = 0;
-	Int border = m_map->getBorderSizeInline();
 	static Int maxBlendTiles = DEFAULT_MAX_FRAME_EXTRABLEND_TILES;
 	if (maxBlendTiles > 10000)
 		maxBlendTiles = 10000;
