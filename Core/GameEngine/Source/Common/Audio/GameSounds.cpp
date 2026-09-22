@@ -133,7 +133,7 @@ Real SoundManager::getCameraAudibleDistance()
 }
 
 //-------------------------------------------------------------------------------------------------
-void SoundManager::addAudioEvent(AudioEventRTS *&eventToAdd)
+Bool SoundManager::addAudioEvent(DynamicAudioEventRTS *eventToAdd)
 {
 	if (m_num2DSamples == 0 && m_num3DSamples == 0) {
 		m_num2DSamples = TheAudio->getNum2DSamples();
@@ -144,13 +144,14 @@ void SoundManager::addAudioEvent(AudioEventRTS *&eventToAdd)
 #ifdef INTENSIVE_AUDIO_DEBUG
 		DEBUG_LOG((" - appended to request list with handle '%d'.", (UnsignedInt) eventToAdd->getPlayingHandle()));
 #endif
-		AudioRequest *audioRequest = TheAudio->allocateAudioRequest( true );
-		audioRequest->m_pendingEvent = eventToAdd;
+		AudioRequest *audioRequest = TheAudio->allocateAudioRequest();
+		audioRequest->m_pendingEvent = RefCountPtr<DynamicAudioEventRTS>::Create_AddRef(eventToAdd);
 		audioRequest->m_request = AR_Play;
 		TheAudio->appendAudioRequest(audioRequest);
-	} else {
-		TheAudio->releaseAudioEventRTS(eventToAdd);
+		return true;
 	}
+
+	return false;
 }
 
 //-------------------------------------------------------------------------------------------------

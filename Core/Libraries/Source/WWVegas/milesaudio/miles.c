@@ -369,7 +369,7 @@ typedef struct SoundObject
     float up[3];
     float vel[3];
     float effectsLevel;
-    void (*eosCallback)(void*);
+    void (__stdcall *eosCallback)(void*);
     void* eosUserData;
     int eosPending;
     struct SoundObject* prev;
@@ -407,7 +407,7 @@ static void Object_Unlink(SoundObject* obj)
 }
 
 typedef struct EOSRequest {
-    void (*eosCallback)(void*);
+    void (__stdcall *eosCallback)(void*);
     void* eosUserData;
 } EOSRequest;
 
@@ -428,6 +428,7 @@ void __stdcall AIL_update(void)
         obj = obj->next;
     }
     Unlock();
+    if (pendingCount) dbg("ail_update: pendingCount=%d\n", pendingCount);
 
     for (int i = 0; i < pendingCount; i++) {
         dbg("ail_update eos cb=%p data=%p\n", (void*)(intptr_t)pending[i].eosCallback, pending[i].eosUserData);
@@ -919,7 +920,8 @@ void __stdcall AIL_start_sample(HSAMPLE sample)
     if (s->base.playing) {
         ma_sound_stop(&s->base.sound);
     }
-    dbg("start2d %p valid=%d vol=%.3f\n", s, s->base.soundValid, s->base.volume);
+    dbg("start2d %p valid=%d vol=%.3f eosPending=%d\n", s, s->base.soundValid, s->base.volume, s->base.eosPending);
+    s->base.eosPending = 0;
     ma_sound_seek_to_pcm_frame(&s->base.sound, 0);
     ma_result r = ma_sound_start(&s->base.sound);
     dbg("start2d %p ma_sound_start=%d\n", s, (int)r);
@@ -1279,6 +1281,13 @@ int __stdcall AIL_set_3D_sample_file(H3DSAMPLE sample, const void* file_image)
         dbg("set3dfile ATTACH FAIL %p\n", s);
         return -1;
     }
+    // Reset per-playback state that AIL_init_sample does for 2D but playSample3D
+    // never called it for 3D. Without this, rateRequest accumulates
+    // (initFilters3D does rate* pitchShift each time) causing stretched/fast
+    // voices after handle reuse.
+    s->base.rateRequest = 0;
+    s->base.eosPending = 0;
+    s->base.playing = 0;
     dbg("set3dfile OK %p rate=%u ch=%u frames=%u\n", s, s->base.blob.rate, s->base.blob.channels, s->base.blob.frames);
     return 0;
 }
@@ -1289,15 +1298,30 @@ static void Stop_All_Sounds(void)
     SoundObject* obj = g_objects;
     while (obj != NULL) {
         if (obj->soundValid && obj->playing) {
-            dbg("stop_all_sounds obj=%p playing=%d\n", obj, obj->playing);
+            dbg("stop_all_sounds obj=%p playing=%d loopCount=%d\n", obj, obj->playing, obj->loopCount);
+            // Prevent Sound_End_Callback from restarting infinite loops (loopCount==0)
+            // after we force-stop on a mission/menu boundary.
+            obj->loopCount = 1;
+            obj->loopsLeft = 0;
+            obj->eosPending = 0;
             ma_sound_stop(&obj->sound);
             obj->playing = 0;
-            obj->loopsLeft = 0;
             ma_sound_set_looping(&obj->sound, MA_FALSE);
         }
         obj = obj->next;
     }
     Unlock();
+}
+
+// Public entry point for Stop_All_Sounds (see its comment above / mss.h).
+// This existed as an internal helper but was never called from anywhere or
+// exposed to the game - nothing actually invoked it, so leaked/untracked
+// sounds (e.g. an AIL_quick_load_and_play stream the caller never
+// AIL_quick_unload'ed) were never forced to stop on a mission/menu boundary.
+void __stdcall AIL_stop_all_sounds(void)
+{
+    dbg("AIL_stop_all_sounds\n");
+    Stop_All_Sounds();
 }
 
 void __stdcall AIL_start_3D_sample(H3DSAMPLE sample)
@@ -1314,7 +1338,8 @@ void __stdcall AIL_start_3D_sample(H3DSAMPLE sample)
     if (s->base.playing) {
         ma_sound_stop(&s->base.sound);
     }
-    dbg("start3d %p valid=%d vol=%.3f\n", s, s->base.soundValid, s->base.volume);
+    dbg("start3d %p valid=%d vol=%.3f eosPending=%d\n", s, s->base.soundValid, s->base.volume, s->base.eosPending);
+    s->base.eosPending = 0;
     ma_sound_seek_to_pcm_frame(&s->base.sound, 0);
     ma_result r = ma_sound_start(&s->base.sound);
     dbg("start3d %p ma_sound_start=%d\n", s, (int)r);
@@ -1814,7 +1839,7 @@ AIL_sample_callback __stdcall AIL_register_EOS_callback(HSAMPLE sample, AIL_samp
     if (s == NULL) {
         return NULL;
     }
-    s->base.eosCallback = (void (*)(void*))EOS;
+    s->base.eosCallback = (void (__stdcall *)(void*))EOS;
     s->base.eosUserData = sample;
     return EOS;
 }
@@ -1825,7 +1850,7 @@ AIL_3dsample_callback __stdcall AIL_register_3D_EOS_callback(H3DSAMPLE sample, A
     if (s == NULL) {
         return NULL;
     }
-    s->base.eosCallback = (void (*)(void*))EOS;
+    s->base.eosCallback = (void (__stdcall *)(void*))EOS;
     s->base.eosUserData = sample;
     return EOS;
 }

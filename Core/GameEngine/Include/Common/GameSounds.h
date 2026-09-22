@@ -47,6 +47,7 @@
 
 // Forward declarations
 class AudioEventRTS;
+class DynamicAudioEventRTS;
 
 class SoundManager : public SubsystemInterface
 {
@@ -67,7 +68,7 @@ class SoundManager : public SubsystemInterface
 		virtual void setCameraAudibleDistance( Real audibleDistance );
 		virtual Real getCameraAudibleDistance();
 
-		virtual void addAudioEvent(AudioEventRTS *&eventToAdd);	// pre-copied
+		virtual Bool addAudioEvent(DynamicAudioEventRTS *eventToAdd);	// pre-copied
 
 		virtual void notifyOf2DSampleStart();
 		virtual void notifyOf3DSampleStart();

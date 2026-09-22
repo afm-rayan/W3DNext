@@ -239,6 +239,14 @@ IMPORTS void __stdcall AIL_stop_sample(HSAMPLE sample);
 IMPORTS void __stdcall AIL_start_sample(HSAMPLE sample);
 IMPORTS void __stdcall AIL_init_sample(HSAMPLE sample);
 IMPORTS void __stdcall AIL_update(void);
+
+// Forcibly stops EVERY currently playing sound object tracked internally
+// (samples, 3D samples, and streams - including any "quick" stream from
+// AIL_quick_load_and_play that the caller forgot to AIL_quick_unload).
+// Call this on any hard stop/reset boundary (leaving a mission, returning
+// to the main menu) as a safety net beyond the game's own per-list cleanup,
+// so nothing keeps playing/queued into the next session.
+IMPORTS void __stdcall AIL_stop_all_sounds(void);
 IMPORTS int __stdcall AIL_set_named_sample_file(
     HSAMPLE sample, const char* file_name, const void* file_image, int file_size, int block);
 IMPORTS void __stdcall AIL_set_3D_sample_effects_level(H3DSAMPLE sample, float effect_level);

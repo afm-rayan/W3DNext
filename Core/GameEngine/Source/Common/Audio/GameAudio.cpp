@@ -437,7 +437,7 @@ AudioHandle AudioManager::addAudioEvent(const AudioEventRTS *eventToAdd)
 		return AHSV_NotForLocal;
 	}
 
-	AudioEventRTS *audioEvent = MSGNEW("AudioEventRTS") AudioEventRTS(*eventToAdd);		// poolify
+	RefCountPtr<DynamicAudioEventRTS> audioEvent = RefCountPtr<DynamicAudioEventRTS>::Create_NoAddRef(newInstance(DynamicAudioEventRTS)(*eventToAdd));
 	audioEvent->setPlayingHandle( allocateNewHandle() );
 	audioEvent->generateFilename();	// which file are we actually going to play?
 	eventToAdd->setPlayingAudioIndex( audioEvent->getPlayingAudioIndex() );
@@ -454,7 +454,6 @@ AudioHandle AudioManager::addAudioEvent(const AudioEventRTS *eventToAdd)
 #if RETAIL_COMPATIBLE_CRC
 	if (notForLocal)
 	{
-		releaseAudioEventRTS(audioEvent);
 		return AHSV_NotForLocal;
 	}
 #endif
@@ -464,21 +463,23 @@ AudioHandle AudioManager::addAudioEvent(const AudioEventRTS *eventToAdd)
 #ifdef INTENSIVE_AUDIO_DEBUG
 		DEBUG_LOG((" - culled due to muting (%d).", audioEvent->getVolume()));
 #endif
-		releaseAudioEventRTS(audioEvent);
 		return AHSV_Muted;
 	}
 
 	if (soundType == AT_Music)
 	{
-		m_music->addAudioEvent(audioEvent);
+		m_music->addAudioEvent(audioEvent.Peek());
 	}
 	else
 	{
 		//Possible to nuke audioEvent inside.
-		m_sound->addAudioEvent(audioEvent);
+		if (!m_sound->addAudioEvent(audioEvent.Peek()))
+		{
+			audioEvent.Clear();
+		}
 	}
 
-	if( audioEvent )
+	if( audioEvent != nullptr )
 	{
 		return audioEvent->getPlayingHandle();
 	}
@@ -576,7 +577,7 @@ void AudioManager::removeAudioEvent(AudioHandle audioEvent)
 		return;
 	}
 
-	AudioRequest *req = allocateAudioRequest( false );
+	AudioRequest *req = allocateAudioRequest();
 	req->m_handleToInteractOn = audioEvent;
 	req->m_request = AR_Stop;
 	appendAudioRequest( req );
@@ -786,10 +787,9 @@ const Coord3D *AudioManager::getListenerPosition() const
 }
 
 //-------------------------------------------------------------------------------------------------
-AudioRequest *AudioManager::allocateAudioRequest( Bool useAudioEvent )
+AudioRequest *AudioManager::allocateAudioRequest()
 {
 	AudioRequest *audioReq = newInstance(AudioRequest);
-	audioReq->m_usePendingEvent = useAudioEvent;
 	audioReq->m_requiresCheckForSample = false;
 	return audioReq;
 }
@@ -1045,13 +1045,6 @@ AudioHandle AudioManager::allocateNewHandle()
 {
 	// note, intenionally a post increment rather than a pre increment.
 	return theAudioHandlePool++;
-}
-
-//-------------------------------------------------------------------------------------------------
-void AudioManager::releaseAudioEventRTS( AudioEventRTS *&eventToRelease )
-{
-	delete eventToRelease;
-	eventToRelease = nullptr;
 }
 
 //-------------------------------------------------------------------------------------------------

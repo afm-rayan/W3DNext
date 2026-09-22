@@ -505,8 +505,7 @@ Drawable::~Drawable()
 
 	stopAmbientSound();
 
-	deleteInstance(m_ambientSound);
-	m_ambientSound = nullptr;
+	m_ambientSound.Clear();
 
 	/// @todo this is nasty, we need a real general effects system
 	// remove any entries that might be present from the ray effect system
@@ -1188,7 +1187,7 @@ void Drawable::updateDrawable()
 		m_selectionFlashEnvelope->update(); // selection flashing
 
 	//If we have an ambient sound, and we aren't currently playing it, attempt to play it now
-	if( m_ambientSound && m_ambientSoundEnabled && !m_ambientSound->m_event.getEventName().isEmpty() && !m_ambientSound->m_event.isCurrentlyPlaying() )
+	if( m_ambientSound && m_ambientSoundEnabled && !m_ambientSound->getEventName().isEmpty() && !m_ambientSound->isCurrentlyPlaying() )
 	{
 		startAmbientSound();
 	}
@@ -3607,7 +3606,7 @@ void Drawable::setID( DrawableID id )
 	{
 		TheGameClient->addDrawableToLookupTable( this );
 		if (m_ambientSound)
-			m_ambientSound->m_event.setDrawableID(m_id);
+			m_ambientSound->setDrawableID(m_id);
 	}
 
 }
@@ -3848,9 +3847,9 @@ void Drawable::startAmbientSound(BodyDamageType dt, TimeOfDay tod)
 	if( audio.getEventName().isNotEmpty() )
 	{
 		if (m_ambientSound == nullptr)
-			m_ambientSound = newInstance(DynamicAudioEventRTS);
+			m_ambientSound = RefCountPtr<DynamicAudioEventRTS>::Create_NoAddRef(newInstance(DynamicAudioEventRTS));
 
-		(m_ambientSound->m_event) = audio;
+		*m_ambientSound = audio;
 		trySound = TRUE;
 	}
 	else if( dt != BODY_PRISTINE && dt != BODY_RUBBLE )
@@ -3862,23 +3861,23 @@ void Drawable::startAmbientSound(BodyDamageType dt, TimeOfDay tod)
 		if( pristineAudio.getEventName().isNotEmpty() )
 		{
 			if (m_ambientSound == nullptr)
-				m_ambientSound = newInstance(DynamicAudioEventRTS);
-			(m_ambientSound->m_event) = pristineAudio;
+				m_ambientSound = RefCountPtr<DynamicAudioEventRTS>::Create_NoAddRef(newInstance(DynamicAudioEventRTS));
+			*m_ambientSound = pristineAudio;
 			trySound = TRUE;
 		}
 	}
 
 	if( trySound && m_ambientSound )
 	{
-		const AudioEventInfo *info = m_ambientSound->m_event.getAudioEventInfo();
+		const AudioEventInfo *info = m_ambientSound->getAudioEventInfo();
 		if( info )
 		{
 			if( BitIsSet( info->m_type, ST_GLOBAL) || info->m_priority == AP_CRITICAL )
 			{
 				//Play it anyways.
-				m_ambientSound->m_event.setDrawableID(getID());
-				m_ambientSound->m_event.setTimeOfDay(tod);
-				m_ambientSound->m_event.setPlayingHandle(TheAudio->addAudioEvent( &m_ambientSound->m_event ));
+				m_ambientSound->setDrawableID(getID());
+				m_ambientSound->setTimeOfDay(tod);
+				m_ambientSound->setPlayingHandle(TheAudio->addAudioEvent( m_ambientSound.Peek() ));
 			}
 			else
 			{
@@ -3888,17 +3887,16 @@ void Drawable::startAmbientSound(BodyDamageType dt, TimeOfDay tod)
 				Real distSqr = vector.lengthSqr();
 				if( distSqr < sqr( info->m_maxDistance ) )
 				{
-					m_ambientSound->m_event.setDrawableID(getID());
-					m_ambientSound->m_event.setTimeOfDay(tod);
-					m_ambientSound->m_event.setPlayingHandle(TheAudio->addAudioEvent( &m_ambientSound->m_event ));
+					m_ambientSound->setDrawableID(getID());
+					m_ambientSound->setTimeOfDay(tod);
+					m_ambientSound->setPlayingHandle(TheAudio->addAudioEvent( m_ambientSound.Peek() ));
 				}
 			}
 		}
 		else
 		{
-			DEBUG_CRASH( ("Ambient sound %s missing! Skipping...", m_ambientSound->m_event.getEventName().str() ) );
-			deleteInstance(m_ambientSound);
-			m_ambientSound = nullptr;
+			DEBUG_CRASH( ("Ambient sound %s missing! Skipping...", m_ambientSound->getEventName().str() ) );
+			m_ambientSound.Clear();
 		}
 	}
 }
@@ -3924,7 +3922,7 @@ void Drawable::startAmbientSound()
 void	Drawable::stopAmbientSound()
 {
 	if (m_ambientSound)
-		TheAudio->removeAudioEvent(m_ambientSound->m_event.getPlayingHandle());
+		TheAudio->removeAudioEvent(m_ambientSound->getPlayingHandle());
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -4262,9 +4260,8 @@ void Drawable::xfer( Xfer *xfer )
 	//and restore it in loadPostProcess().
 	if( xfer->getXferMode() == XFER_LOAD && m_ambientSound )
 	{
-		TheAudio->killAudioEventImmediately( m_ambientSound->m_event.getPlayingHandle() );
-		deleteInstance(m_ambientSound);
-		m_ambientSound = nullptr;
+		TheAudio->killAudioEventImmediately( m_ambientSound->getPlayingHandle() );
+		m_ambientSound.Clear();
 	}
 
 	// drawable id
