@@ -11,6 +11,7 @@ set(WWVEGAS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../Libraries/Source/WWVegas)
 
 add_executable(w3d_d3d11_smoke
     main.cpp
+    smoke_backend_stubs.cpp
     ${WWVEGAS_DIR}/WW3D2/Backend/D3D11Backend.cpp
     ${WWVEGAS_DIR}/WW3D2/Backend/D3D11Backend.h
     ${WWVEGAS_DIR}/WW3D2/Backend/D3D11FVF.cpp
@@ -30,6 +31,7 @@ target_include_directories(w3d_d3d11_smoke PRIVATE
 
 target_link_libraries(w3d_d3d11_smoke PRIVATE
     corei_always   # Utility/, Lib/, rts/ include dirs pulled in by WWLib headers
+    d3d8lib        # fetched min-dx8-sdk headers (D3DBLEND_* etc.)
     d3d11
     dxgi
     d3dcompiler    # runtime HLSL compilation of the FF-emulation VS/PS

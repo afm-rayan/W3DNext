@@ -43,6 +43,7 @@ target_link_libraries(core_particleeditor PRIVATE
     corei_gameengine_include
     corei_libraries_source_wwvegas
     corei_libraries_source_wwvegas_wwlib
+    corei_libraries_source_wwvegas_wwdebug
     stlport
 )
 

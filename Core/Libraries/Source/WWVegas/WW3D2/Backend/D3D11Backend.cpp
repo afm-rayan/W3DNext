@@ -3154,6 +3154,13 @@ void D3D11Backend::Set_Blend_Func(RenderBackendBlendFactor src, RenderBackendBle
 // soft-water-edge DESTALPHA blend and the water alpha pass set these through
 // the legacy path, which has no ShaderClass equivalent). Single-sided so the
 // render-state vector stays the single source of truth.
+//
+// The game targets get D3DBLEND_* from the z_ww3d2/g_ww3d2 precompiled header
+// (dx8wrapper.h -> d3d8.h). The d3d11_smoke oracle compiles this .cpp without
+// that PCH, so pull the enum declarations in explicitly; d3d8lib (linked by
+// both) provides the header directory.
+#include <d3d8types.h>
+
 static RenderBackendBlendFactor D3DBlend_To_RB(unsigned int v)
 {
 	switch (v) {
@@ -4308,6 +4315,12 @@ void D3D11Backend::Draw_Screen_Filter_Quad(const RenderBackendFilterQuad & quad)
 // sample them directly. The D3D11 backend owns the real D3D11 textures keyed by
 // the returned TextureClass*; Set_Texture (D3D11Backend_W3D.cpp) detects these and
 // binds the pre-made SRV so the scene samples the reflection/shadow, not null.
+//
+// The bodies need the W3D texture graph (TextureClass / NEW_REF), which only the
+// game build links. The standalone smoke oracle links no ww3d2 library, so it
+// compiles the fallback stubs at the end of this block instead (W3DNEXT_D3D11_W3D_TU
+// is defined by the game's z_ww3d2/g_ww3d2 target, undefined for the oracle).
+#ifdef W3DNEXT_D3D11_W3D_TU
 static DXGI_FORMAT WW3DFormat_To_DXGI(WW3DFormat fmt)
 {
 	switch (fmt) {
@@ -4436,6 +4449,22 @@ bool D3D11Backend::Is_Render_To_Texture()
 {
 	return m_savedBackBufferRTV != nullptr;
 }
+#else // !W3DNEXT_D3D11_W3D_TU - standalone smoke build
+TextureClass * D3D11Backend::Create_Render_Target(int, int, WW3DFormat)
+{
+	return nullptr;
+}
+
+void D3D11Backend::Set_Render_Target_With_Z(TextureClass *, ZTextureClass *)
+{
+	D3D11_STUB();
+}
+
+bool D3D11Backend::Is_Render_To_Texture()
+{
+	return false;
+}
+#endif // W3DNEXT_D3D11_W3D_TU
 
 void D3D11Backend::Set_Shadow_Map(int idx, ZTextureClass * ztex)
 {
