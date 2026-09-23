@@ -68,7 +68,25 @@ Written to a single constant buffer per frame:
 | `GradeMode.x` | NV on/off | night-vision branch |
 | `GradeMode.y` | `1.0` | god rays (dust-mote radial march toward the sun) |
 | `GradeMode.z` | `1.0` | filmic tone-map + bloom |
-| `Bloom` | exposure `1.06`, strength `0.40`, threshold `0.55`, radius `1.0` | bloom controls |
+| `Bloom` | exposure `1.03`, strength `0.1125`, threshold `0.80`, radius `1.0` | bloom controls |
+
+All four bloom/god-ray values have live env overrides (see
+[Environment variables](#environment-variables)) so they can be A/B'd without
+a rebuild.
+
+### Bloom vs. water
+
+Open sea used to wash out to a flat white sheet: broad sky/sea reflection is
+bright enough to trip the bloom bright pass, and the sun glint is white
+(warm), so a colour-keyed rejection alone was not enough. Three changes fix it:
+
+- The water pixel shader hard-caps its final colour at `0.75` — below the
+  default bloom threshold `0.80` — so water can never feed the bloom (or the
+  god-ray march gate) in the first place.
+- The bloom bright pass additionally rejects blue-dominant samples
+  (`1 - saturate((b-r)/b) * 0.9`), which keeps the halo off the sea and sky.
+- The lake reflection factor is `0.35` (was `0.6`): looking down, the water
+  keeps more of its own deep-tint colour instead of mirroring the bright sky.
 
 ### Pixel-shader order of operations
 
@@ -153,6 +171,10 @@ Summary:
 | Variable | Default | Effect |
 |---|---|---|
 | `W3DNEXT_GRADE` | on | `0` disables the color-grade pass entirely |
+| `W3DNEXT_GRADE_EXPOSURE` | `1.03` | pre-tone-map exposure (clamped 0.5–2.0) |
+| `W3DNEXT_GRADE_BLOOM` | `0.1125` | bloom strength (0–1; `0` disables the gather, tone-map stays) |
+| `W3DNEXT_GRADE_BLOOM_THRESHOLD` | `0.80` | bright-pass threshold (0.05–0.98) |
+| `W3DNEXT_GRADE_GODRAYS` | `1.0` | god-ray scale (0–3; `0` disables the shafts) |
 | `D3D11_SHOT` | `E:\GAVAD_Test\dncshot.tga` | F10 screenshot output path |
 | `W3DNEXT_DAYCYCLE` | on | `0` disables the accelerated day/night cycle |
 | `W3DNEXT_DAYCYCLE_MINUTES` | `4` | Length of one full day/night loop (1–1440 min) |
@@ -172,3 +194,10 @@ array so the night vision filter has actual darkness to work with; it lives in
   green, timed grain, vignette), neutral when `GradeMode.x = 0`.
 - `f44129b` — *chore: snap current D3D11 work for public GitHub release*:
   color grade, god rays, bloom and the current tuning constants landed here.
+- Water/grade tuning pass (post-v0.2.0): sea-water over-bloom fix (water cap,
+  blue-bias rejection, reflection `0.6 -> 0.35`), bloom defaults
+  `0.40/0.55 -> 0.1125/0.80` with live env knobs, god rays
+  `1.7 -> 0.9` with a tighter sun falloff, deeper water tints, and a
+  reflection-RTT stage-binding refcount fix (the freed reflection SRV was
+  being sampled as whatever resource reused its memory — the "reflection
+  shows the menu / an explosion" corruption and the follow-on crashes).
