@@ -1847,6 +1847,27 @@ void D3D11Backend::Evict_Render_Target(TextureBaseClass * tex)
 		Bind_Back_Buffer_Targets();
 		m_savedBackBufferRTV = nullptr;
 	}
+	// Unbind the SRV/sampler from any texture stage still pointing at them,
+	// and drop that stage's reference, before the RTT releases its own. The
+	// immediate context only keeps raw pointers, so releasing a bound view
+	// leaves freed memory live in the pipeline (the water-reflection
+	// "samples whatever texture reused the slot" corruption).
+	if (m_context != nullptr) {
+		for (unsigned int s = 0; s < RB_MAX_TEXTURE_STAGES; ++s) {
+			if (m_stageSRV[s] == t.srv) {
+				ID3D11ShaderResourceView * nullSRV = nullptr;
+				m_context->PSSetShaderResources(s, 1, &nullSRV);
+				Safe_Release(m_stageSRV[s]);
+				m_stageSRV[s] = nullptr;
+			}
+			if (m_stageSampler[s] == t.sampler) {
+				ID3D11SamplerState * nullSmp = nullptr;
+				m_context->PSSetSamplers(s, 1, &nullSmp);
+				Safe_Release(m_stageSampler[s]);
+				m_stageSampler[s] = nullptr;
+			}
+		}
+	}
 	Safe_Release(t.sampler);
 	Safe_Release(t.dsv);
 	Safe_Release(t.depthTex);
@@ -3995,6 +4016,29 @@ void D3D11Backend::Set_Sun_Screen(float x, float y, float intensity)
 	m_sunScreen[2] = intensity;
 }
 
+namespace
+{
+// Env-tunable grade knob: name is the suffix after W3DNEXT_, value clamped to
+// [lo, hi] so a typo cannot blow the pass out. Used for the bloom / god-ray
+// tuning so those can be A/B'd at runtime (set the env var and relaunch)
+// without a rebuild - the live symptom is sea water over-blooming.
+float GradeEnvClamp(const char * suffix, float fallback, float lo, float hi)
+{
+	const char * v = W3DNext_GetEnv(suffix);
+	if (v == nullptr || v[0] == '\0') {
+		return fallback;
+	}
+	char * end = nullptr;
+	const float f = std::strtof(v, &end);
+	if (end == v) {
+		return fallback;
+	}
+	if (f < lo) return lo;
+	if (f > hi) return hi;
+	return f;
+}
+}
+
 void D3D11Backend::Apply_Color_Grade()
 {
 	// W3DNext color-grading post-process. Runs once per frame at End_Frame,
@@ -4066,17 +4110,27 @@ void D3D11Backend::Apply_Color_Grade()
 	gc.Tint[1] = 1.00f;
 	gc.Tint[2] = 0.97f;
 	gc.Tint[3] = 1.0f;
+	// Live-tunable knobs (env overrides, clamped) so these can be A/B'd
+	// without a rebuild - the sea-water over-bloom was tuned this way:
+	//   W3DNEXT_GRADE_EXPOSURE        default 1.03 (0.5 .. 2.0)
+	//   W3DNEXT_GRADE_BLOOM           default 0.1125 (0.0 .. 1.0; 0 = off)
+	//   W3DNEXT_GRADE_BLOOM_THRESHOLD default 0.80 (0.05 .. 0.98)
+	//   W3DNEXT_GRADE_GODRAYS         default 1.0  (0.0 .. 3.0; 0 = off)
+	const float exposure = GradeEnvClamp("GRADE_EXPOSURE", 1.03f, 0.5f, 2.0f);
+	const float bloomStrength = GradeEnvClamp("GRADE_BLOOM", 0.1125f, 0.0f, 1.0f);
+	const float bloomThreshold = GradeEnvClamp("GRADE_BLOOM_THRESHOLD", 0.80f, 0.05f, 0.98f);
+	const float godrayScale = GradeEnvClamp("GRADE_GODRAYS", 1.0f, 0.0f, 3.0f);
 	gc.Mode[0] = m_gradeNightVision ? 1.0f : 0.0f;
-	gc.Mode[1] = 1.0f;     // god rays enable
-	gc.Mode[2] = 1.0f;     // filmic tone-map + bloom enable
+	gc.Mode[1] = (godrayScale > 0.001f) ? 1.0f : 0.0f;   // god rays enable
+	gc.Mode[2] = 1.0f;     // filmic tone-map (+ bloom when strength > 0)
 	gc.Mode[3] = 0.0f;
 	gc.Sun[0] = m_sunScreen[0];
 	gc.Sun[1] = m_sunScreen[1];
-	gc.Sun[2] = m_sunScreen[2];
+	gc.Sun[2] = m_sunScreen[2] * godrayScale;
 	gc.Sun[3] = 0.0f;
-	gc.Bloom[0] = 1.06f;   // exposure
-	gc.Bloom[1] = 0.40f;   // bloom strength
-	gc.Bloom[2] = 0.55f;   // bloom threshold
+	gc.Bloom[0] = exposure;
+	gc.Bloom[1] = bloomStrength;
+	gc.Bloom[2] = bloomThreshold;
 	gc.Bloom[3] = 1.0f;    // bloom radius (texels)
 	m_context->UpdateSubresource(m_gradeBuffer, 0, nullptr, &gc, 0, 0);
 

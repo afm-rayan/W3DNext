@@ -786,10 +786,23 @@ void D3D11Backend::Set_Texture(unsigned int stage, TextureBaseClass * texture)
 		auto it = m_rtt.find(texture);
 		if (it != m_rtt.end()) {
 			m_stageNeutral[stage] = false;
+			// Same refcount discipline as Bind_Cached_Texture: drop the previous
+			// stage reference before adopting the RTT's SRV/sampler, then AddRef
+			// what we adopt. Without this the borrowed RTT pointers were
+			// over-released by the next tracked bind (or Release_Texture_Stages),
+			// freeing an SRV that m_rtt still referenced - water then sampled
+			// whatever resource reused that freed memory ("the reflection shows
+			// the menu / an explosion") and hard crashes followed.
+			if (m_stageTexture[stage] != nullptr) m_stageTexture[stage]->Release();
+			if (m_stageSRV[stage] != nullptr) m_stageSRV[stage]->Release();
+			if (m_stageSampler[stage] != nullptr) m_stageSampler[stage]->Release();
+			m_stageTexture[stage] = nullptr; // game-owned; the RTT map holds it
 			m_stageSRV[stage] = it->second.srv;
 			m_stageSampler[stage] = it->second.sampler;
-			m_context->PSSetShaderResources(stage, 1, &it->second.srv);
-			m_context->PSSetSamplers(stage, 1, &it->second.sampler);
+			if (m_stageSRV[stage] != nullptr) m_stageSRV[stage]->AddRef();
+			if (m_stageSampler[stage] != nullptr) m_stageSampler[stage]->AddRef();
+			m_context->PSSetShaderResources(stage, 1, &m_stageSRV[stage]);
+			m_context->PSSetSamplers(stage, 1, &m_stageSampler[stage]);
 			return;
 		}
 	}

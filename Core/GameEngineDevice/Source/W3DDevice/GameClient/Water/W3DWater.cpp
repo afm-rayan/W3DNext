@@ -3655,7 +3655,7 @@ void WaterRenderObjClass::drawTrapezoidWater(Vector3 points[4], float layerAlpha
 				lakeSunDir.Normalize();
 				be->Set_Water_Constants(
 					lakeSunDir, lakeSunColor, // sun direction + tint (now time-of-day tracked)
-					0.02f, realReflection ? 0.6f : 0.0f, 0.7f, // bump/refl/glitter/time/viewport
+					0.02f, realReflection ? 0.35f : 0.0f, 0.7f, // bump/refl/glitter/time/viewport
 					(float)timeGetTime(), vw, vh);      // (refl=0 -> sky fallback only if RTT missing)
 				be->Set_Water_Pixel_Shader(true);
 			}
