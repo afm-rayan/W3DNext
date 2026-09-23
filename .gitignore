@@ -9,6 +9,7 @@
 *.user
 *.ncb
 /build*
+/_release/
 nbproject/
 project/
 doxygen/
